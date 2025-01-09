@@ -2,6 +2,8 @@ apiVersion: v1
 kind: Pod
 metadata:
   name: mavis
+  labels:
+    app.kubernetes.io/name: mavis
   annotations:
     k8s.v1.cni.cncf.io/networks: mainnet-vlan
 spec:
@@ -11,15 +13,39 @@ spec:
       effect: NoSchedule
   containers:
     - name: mavis
+      securityContext:
+        capabilities:
+          add:
+            - sys_chroot
+            - audit_write
       image: registry.cjbal.com/mavis
       resources:
         limits:
-          nvidia.com/gpu: 1
-      command: [/bin/sh, -c, "cargo run --bin mavis --features cudnn"]
+          nvidia.com/gpu: 2
+      command: ["/bin/sh", "-c", "sshd -D"]
       volumeMounts:
         - name: models
           mountPath: /ceph-fuse/public/neural_models/
+        - name: data
+          mountPath: /ceph-fuse/public/k8s/mavis/data
   volumes:
     - name: models
       hostPath:
         path: /ceph-fuse/public/neural_models/
+    - name: data
+      hostPath:
+        path: /ceph-fuse/public/k8s/mavis/data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mavis
+spec:
+  selector:
+    app.kubernetes.io/name: mavis
+  ports:
+    - protocol: TCP
+      port: 22
+      targetPort: 22
+  externalIPs:
+    - fdb7:1860:52b3:2601::370
