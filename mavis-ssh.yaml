@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mavis
+  annotations:
+    k8s.v1.cni.cncf.io/networks: mainnet-vlan
+spec:
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+  containers:
+    - name: mavis
+      image: registry.cjbal.com/mavis
+      resources:
+        limits:
+          nvidia.com/gpu: 1
+      command: [/bin/sh, -c, "cargo run --bin mavis --features cudnn"]
+      volumeMounts:
+        - name: models
+          mountPath: /ceph-fuse/public/neural_models/
+  volumes:
+    - name: models
+      hostPath:
+        path: /ceph-fuse/public/neural_models/

@@ -1,0 +1,38 @@
+[package]
+name = "mavis"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "mavis"
+path = "src/main.rs"
+
+[[bin]]
+name = "vision_demo"
+path = "src/vision_demo.rs"
+
+[dependencies]
+argparse = "0.2.1"
+futures = "0.3.31"
+bytes = "1.9.0"
+mumble-protocol = "0.4.1"
+tokio-util = {version= "0.6", features=["net", "codec"] }
+tokio-native-tls = "0.3.1"
+ollama-rs = "0.2.1"
+tokio = { version = "1.42", features = ["rt", "rt-multi-thread", "macros"] }
+base64 = "0.22.1"
+reqwest = "0.12.9"
+candle-transformers = "0.8.1"
+candle-core = "0.8.1"
+candle-nn = "0.8.1"
+candle-examples = "0.8.1"
+hf-hub = "0.4.1"
+serde_json = "1.0.132"
+tokenizers = "0.19.1"
+anyhow = "1.0.95"
+tracing = {version="0.1.41", features=["log-always"]}
+tracing-subscriber = "0.3"
+
+[features]
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/flash-attn"]
+cudnn = ["candle-core/cudnn", "cuda", "candle-transformers/flash-attn"]
