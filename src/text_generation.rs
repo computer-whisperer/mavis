@@ -27,7 +27,9 @@ pub struct TextGeneration {
     repeat_last_n: usize,
     eos_token_id: LlamaEosToks,
     bos_token_id: u32,
-    optimizer: SGD
+    optimizer: AdamW,
+    max_inference_context_tokens: usize,
+    max_train_context_tokens: usize
 }
 
 impl TextGeneration {
@@ -66,7 +68,7 @@ impl TextGeneration {
         }
         let vb = VarBuilder::from_backend(Box::new(var_map.clone()), dtype, device.clone());
         let cache = Cache::new(true, dtype, &config, &device)?;
-        let r = 16;
+        let r = 256;
         let lora_config = LoraConfig::new(r, (r as f64)*2.0, None);
         let lora_linear_config = LoraLinearConfig::new(config.hidden_size, config.hidden_size);
         let lora_embedding_config = LoraEmbeddingConfig::new(config.vocab_size, config.hidden_size);
@@ -79,13 +81,11 @@ impl TextGeneration {
         let eos_token_id = LlamaEosToks::Multiple(eos_vec);
 
         let adamw_params = candle_nn::ParamsAdamW {
-            lr: 5.0,
+            lr: 0.00001,
             ..Default::default()
         };
-        let mut optimizable_layers = var_map.all_vars();
 
-
-        let optimizer = SGD::new(optimizable_layers, 1.0).unwrap();
+        let optimizer = AdamW::new(var_map.all_vars(), adamw_params).unwrap();
         Ok(Self {
             model,
             device,
@@ -100,19 +100,27 @@ impl TextGeneration {
             repeat_last_n: 10,
             bos_token_id,
             eos_token_id,
-            optimizer
+            optimizer,
+            max_inference_context_tokens: 400,
+            max_train_context_tokens: 250
         })
     }
 
-    pub fn train(&mut self, context: &str) -> Result<()> {
+    pub fn train(&mut self, context: &str, learning_rate: f64) -> Result<()> {
         self.tokenizer.clear();
+        self.cache.reset();
+        self.optimizer.set_learning_rate(learning_rate);
         let mut input_tokens = vec![self.bos_token_id];
         input_tokens.extend(self.tokenizer.tokenizer().encode(context, true).unwrap().get_ids().to_vec());
+        if input_tokens.len() > self.max_train_context_tokens {
+            input_tokens.truncate(self.max_train_context_tokens)
+        }
         let input_tensor = Tensor::new(input_tokens, &self.device)?.unsqueeze(0)?;
         //println!("input tensor shape: {:?}", input_tensor.shape());
         let context_tensor = input_tensor.i((.., ..input_tensor.dim(1)?-1))?;
         //println!("context tensor shape: {:?}", context_tensor.shape());
         let logits = self.model.forward_for_training(&context_tensor, 0, &self.cache)?.squeeze(0)?;
+        self.cache.reset();
         //println!("output logits shape: {:?}", logits.shape());
         let log_sm = ops::log_softmax(&logits, 1)?;
         //println!("output log_sm shape: {:?}", log_sm.shape());
@@ -153,13 +161,125 @@ impl TextGeneration {
         self.context_text.clone()
     }
 
+    pub fn test_next_generation(&mut self, filter: &str) -> Result<bool> {
+        use std::io::Write;
+        use anyhow::Error as E;
+        self.tokenizer.clear();
+        let mut local_context_tokens = self.context_tokens.clone();
+
+        self.cache.reset();
+        self.num_context_tokens_processed = 0;
+
+        if self.context_tokens.len() > self.max_inference_context_tokens {
+            self.context_tokens.truncate(self.max_inference_context_tokens)
+        }
+
+        let mut local_tokens_processed = 0usize;
+
+        let mut generated_text = String::new();
+
+        let sample_len = 100;
+        let mut output = String::new();
+        let start_gen = std::time::Instant::now();
+        for index in 0..sample_len {
+            let logits = {
+                if self.cache.use_kv_cache {
+                    let ctxt = &local_context_tokens[local_tokens_processed..];
+                    let input = Tensor::new(ctxt, &self.device)?.unsqueeze(0)?;
+                    let res = self.model.forward(&input, local_tokens_processed, &self.cache)?;
+                    local_tokens_processed = local_context_tokens.len();
+                    res
+                }
+                else {
+                    let ctxt = &local_context_tokens[..];
+                    let input = Tensor::new(ctxt, &self.device)?.unsqueeze(0)?;
+                    let res = self.model.forward(&input, 0, &self.cache)?;
+                    res
+                }
+            };
+            //println!("output logits shape: {:?}", logits.shape());
+            let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
+            let logits = if self.repeat_penalty == 1. {
+                logits
+            } else {
+                let start_at = local_context_tokens.len().saturating_sub(self.repeat_last_n);
+                candle_transformers::utils::apply_repeat_penalty(
+                    &logits,
+                    self.repeat_penalty,
+                    &local_context_tokens[start_at..],
+                )?
+            };
+
+            let next_token = self.logits_processor.sample(&logits)?;
+
+            match self.eos_token_id {
+                LlamaEosToks::Single(eos_tok_id) if next_token == eos_tok_id => {
+                    //print!("Got EOS token.");
+                    std::io::stdout().flush()?;
+                    break;
+                }
+                LlamaEosToks::Multiple(ref eos_ids) if eos_ids.contains(&next_token) => {
+                    //print!("Got EOS token.");
+                    std::io::stdout().flush()?;
+                    break;
+                }
+                _ => (),
+            }
+            if let Some(t) = self.tokenizer.next_token(next_token)? {
+                generated_text.push_str(t.as_str());
+
+                if generated_text.len() > filter.len() {
+                    break;
+                }
+
+                //print!("{t}");
+                std::io::stdout().flush()?;
+            }
+            local_context_tokens.push(next_token);
+        }
+
+        self.cache.reset();
+        self.num_context_tokens_processed = 0;
+
+        let mut is_match = true;
+
+        if generated_text.len() > filter.len() {
+            for i in 0..filter.len() {
+                if generated_text.chars().nth(i).unwrap() != filter.chars().nth(i).unwrap() {
+                    is_match = false;
+                    break;
+                }
+            }
+        }
+        else {
+            is_match = false;
+        }
+
+        println!("Looking for \"{}\", generated \"{}\"", filter, generated_text);
+
+        Ok(is_match)
+    }
+
     pub(crate) fn run(&mut self, prompt: &str) -> Result<String> {
+        //println!("{}, {}, {}", self.num_context_tokens_processed, self.context_tokens.len(), self.cache.get_cached_token_count());
+
         use std::io::Write;
         use anyhow::Error as E;
         self.tokenizer.clear();
         self.context_text.push_str(prompt);
         let mut new_tokens = self.tokenizer.tokenizer().encode(prompt, true).unwrap().get_ids().to_vec();
         self.context_tokens.append(&mut new_tokens);
+
+        if self.context_tokens.len() > self.max_inference_context_tokens {
+            self.context_tokens.truncate(self.max_inference_context_tokens)
+        }
+
+        if self.num_context_tokens_processed+1 < self.context_tokens.len() {
+            // For now we do this, hopefully we can fix later
+            self.cache.reset();
+            self.num_context_tokens_processed = 0;
+        }
+
         let mut generated_tokens = 0usize;
 
         let sample_len = 50;
@@ -199,12 +319,12 @@ impl TextGeneration {
             generated_tokens += 1;
             match self.eos_token_id {
                 LlamaEosToks::Single(eos_tok_id) if next_token == eos_tok_id => {
-                    print!("Got EOS token.");
+                    //print!("Got EOS token.");
                     std::io::stdout().flush()?;
                     break;
                 }
                 LlamaEosToks::Multiple(ref eos_ids) if eos_ids.contains(&next_token) => {
-                    print!("Got EOS token.");
+                    //print!("Got EOS token.");
                     std::io::stdout().flush()?;
                     break;
                 }
@@ -222,10 +342,10 @@ impl TextGeneration {
                         output.push_str(rest);
                         print!("{rest}");
                         std::io::stdout().flush()?;
-                        println!("Got newline (partial token)");
+                        //println!("Got newline (partial token)");
                         break;
                     }
-                    println!("Got newline");
+                    //println!("Got newline");
                     break;
                 }
                 output.push_str(&t);

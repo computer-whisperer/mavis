@@ -11,6 +11,7 @@ use std::fs;
 use std::time::{Duration};
 use futures::{SinkExt, StreamExt};
 use mumble_protocol::control::{msgs, ClientControlCodec, ControlPacket};
+use regex::Regex;
 use tokio::net::TcpStream;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -153,6 +154,8 @@ pub(crate) async fn handle_udp(
     mut speech_to_text: SpeechToText,
     mut new_stt_tx: mpsc::Sender<(u32, String)>,
 ) {
+    let re = Regex::new(r"<[^>]*>").unwrap();
+
     // Bind UDP socket
     let udp_socket = UdpSocket::bind((Ipv6Addr::from(0u128), 0u16))
         .await
@@ -244,9 +247,11 @@ pub(crate) async fn handle_udp(
                                     let res = speech_to_text.run(&mel, None).unwrap();
                                     speech_to_text.reset_kv_cache();
                                     for segment in res {
-                                        if segment.dr.no_speech_prob < 0.4 {
-                                            new_stt_tx.send((session_id, segment.dr.text)).await.unwrap();
-                                        }
+                                        if segment.dr.no_speech_prob < 0.3 {
+                                            // Strip all special tokens (like <thing>)
+                                            let text = re.replace_all(segment.dr.text.as_str(), "").into_owned();
+                                            new_stt_tx.send((session_id, text)).await.unwrap();
+                                       }
                                     }
                                 }
                             }

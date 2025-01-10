@@ -44,17 +44,26 @@ async fn main() {
     };
     let mut text_generation = TextGeneration::new(device_a.clone()).unwrap();
 
-    for _ in 0..100 {
-        text_generation.train("[mavis]: I'm alive! \n").unwrap();
+/*
+    text_generation.run("This is a long").unwrap();
+    text_generation.add_context("This is a long").unwrap();
+    text_generation.run("This is a different").unwrap();
+    return;*/
+    /*
+    text_generation.clear_context();
+    for _ in 0..10 {
+        text_generation.train("This is a long, mysterious string that I want to burn hard into the llm's memory. What happens now?").unwrap();
     }
-
-    text_generation.run("this is").unwrap();
+    text_generation.run("This is a long");
+    text_generation.clear_context();
+    text_generation.run("This is a different");
+    text_generation.clear_context();
     return;
-
+*/
     let mut chat_bot = ChatBot::new(text_generation);
     chat_bot.load_context();
 
-
+    chat_bot.text_generation.clear_context();
 
     let mut speech_to_text = SpeechToText::new(device_b).unwrap();
 

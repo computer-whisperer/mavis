@@ -4,7 +4,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::fs::File;
 use std::io::Write;
+use std::time::Duration;
 use chrono::{DateTime, Utc};
+use tokio::time::sleep;
 use crate::text_generation::TextGeneration;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
@@ -16,7 +18,8 @@ struct TextMessageRecord {
 
 impl TextMessageRecord {
     fn to_llm_text(&self) -> String {
-        let stripped_text = self.text.replace("\n", " ");
+        let temp = self.text.replace("\n", " ");
+        let stripped_text = temp.trim();
         format!("[{}]: {} \n", self.username, stripped_text)
     }
 }
@@ -30,7 +33,7 @@ struct STTMessageRecord {
 
 impl STTMessageRecord {
     fn to_llm_text(&self) -> String {
-        format!("[{}]: {} \n", self.username, self.text)
+        format!("[{}]: {} \n", self.username, self.text.trim())
     }
 }
 
@@ -43,7 +46,7 @@ struct GeneratedMessageRecord {
 
 impl GeneratedMessageRecord {
     fn to_llm_text(&self) -> String {
-        format!("[{}]: {} \n", self.username, self.text)
+        format!("[{}]: {} \n", self.username, self.text.trim())
     }
 }
 
@@ -66,7 +69,7 @@ impl Record {
 
 pub(crate) struct ChatBot {
     loaded_context: Vec<Record>,
-    text_generation: TextGeneration,
+    pub(crate) text_generation: TextGeneration,
     context_log_file: Option<File>,
     data_directory: String,
     username: String
@@ -83,7 +86,24 @@ impl ChatBot {
         }
     }
 
+    pub fn load_pre_context(&mut self, path: &str) -> anyhow::Result<()> {
+        let text = fs::read_to_string(path)?;
+
+        for _ in 0..4 {
+            let mut start_offset = 0;
+            while start_offset > text.len() {
+                self.text_generation.train(&text.as_str()[start_offset..], 0.0001)?;
+                start_offset += 100;
+            }
+        }
+
+
+        Ok(())
+    }
+
     pub fn load_context(&mut self) {
+        self.load_pre_context(format!("{}pre_context_train.txt", self.data_directory).as_str()).unwrap();
+
         let mut files: Vec<_> = fs::read_dir(format!("{}context/", self.data_directory)).unwrap().map(|r| r.unwrap()).collect();
         files.sort_by_key(|dir| dir.path());
         for filename in files {
@@ -114,10 +134,10 @@ impl ChatBot {
         if current_context_len > 256 {
             println!("Training lora! ({} tokens)", current_context_len);
             let context_string = self.text_generation.get_context_string();
-            self.text_generation.train(context_string.as_str()).unwrap();
+            self.text_generation.train(context_string.as_str(), 0.00005).unwrap();
             self.text_generation.clear_context();
 
-            let records_to_keep = 24.min(self.loaded_context.len()/4);
+            let records_to_keep = 32.min(self.loaded_context.len()/4);
             // Delete all but the most recent records
             self.loaded_context.drain(0..(self.loaded_context.len() - records_to_keep));
 
@@ -133,13 +153,40 @@ impl ChatBot {
             self.export_new_record(&record);
         }
         let llm_text = record.to_llm_text();
-        if llm_text.len() < 100 {
+        if llm_text.len() < 200 {
             self.loaded_context.push(record);
             if add_to_llm_context {
                 self.text_generation.add_context(llm_text.as_str()).unwrap();
                 self.roll_text_generation_context();
             }
         }
+    }
+
+    pub async fn prompt_model(&mut self, mut new_tx_messages_tx: &mpsc::Sender<String>, force_first: bool) -> anyhow::Result<()> {
+        for i in 0..4 {
+            if (i == 0 && force_first) || self.text_generation.test_next_generation("[mavis]:")? {
+                let result = self.text_generation.run(format!("[{}]:", self.username).as_str());
+                if let Ok(mut text_result) = result {
+                    self.text_generation.add_context("\n").unwrap();
+                    new_tx_messages_tx.send(text_result.clone()).await.unwrap();
+                    let new_record = Record::GeneratedMessage(GeneratedMessageRecord{
+                        time: Utc::now(),
+                        username: self.username.clone(),
+                        text: text_result.replace("\n", " ")
+                    });
+                    self.process_new_record(new_record, true, false);
+                    sleep(Duration::from_secs(1)).await;
+                }
+                else {
+                    println!("Error generating response: {:?}", result);
+                }
+
+            }
+            else {
+                break;
+            }
+        }
+        Ok(())
     }
 
     pub async fn run(
@@ -161,30 +208,20 @@ impl ChatBot {
                     println!("{}", new_record.to_llm_text().replace("\n", " "));
                     self.process_new_record(new_record, true, true);
 
-                    let result = self.text_generation.run(format!("[{}]:", self.username).as_str());
-                    if let Ok(mut text_result) = result {
-                        self.text_generation.add_context("\n").unwrap();
-                        new_tx_messages_tx.send(text_result.clone()).await.unwrap();
-                        let new_record = Record::GeneratedMessage(GeneratedMessageRecord{
-                            time: Utc::now(),
-                            username: self.username.clone(),
-                            text: text_result.replace("\n", " ")
-                        });
-                        self.process_new_record(new_record, true, false);
-                    }
-                    else {
-                        println!("Error generating response: {:?}", result);
-                    }
+                    self.prompt_model(&new_tx_messages_tx, true).await.unwrap();
                 }
                 Some((session_id, text)) = new_stt_rx.recv() => {
                     let username = user_map.lock().unwrap().get(&session_id).cloned().unwrap_or_else(|| String::from("Unknown"));
+                    let sanitized_text = String::from(text.trim());
                     let new_record = Record::STTMessage(STTMessageRecord{
                         time: Utc::now(),
                         username,
-                        text
+                        text: sanitized_text
                     });
                     println!("{}", new_record.to_llm_text().replace("\n", " "));
                     self.process_new_record(new_record, true, true);
+
+                    self.prompt_model(&new_tx_messages_tx, false).await.unwrap();
                 }
             }
         }

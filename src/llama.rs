@@ -182,6 +182,14 @@ impl Cache {
         self.masks = Arc::new(Mutex::new(HashMap::new()));
         self.kvs = Arc::new(Mutex::new(vec![None; self.num_hidden_layers]));
     }
+
+    pub fn get_cached_token_count(&self) -> usize {
+        let w = self.kvs.lock().unwrap();
+        match &w[0] {
+            Some((k, _)) => {k.dims()[2]}
+            None => 0,
+        }
+    }
 }
 
 fn linear_with_lora(
@@ -412,7 +420,7 @@ impl CausalSelfAttention {
         Ok(rope)
     }
 
-    fn forward(&self, x: &Tensor, index_pos: usize, block_idx: usize, cache: &Cache) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, index_pos: usize, block_idx: usize, cache: &Cache, detach_grads: bool) -> Result<Tensor> {
         let _enter = self.span.enter();
         let (b_sz, seq_len, hidden_size) = x.dims3()?;
         let q = self.q_proj.forward(x)?;
@@ -453,7 +461,12 @@ impl CausalSelfAttention {
                         .contiguous()?
                 }
             }
-            cache[block_idx] = Some((k.clone(), v.clone()))
+            if detach_grads {
+                cache[block_idx] = Some((k.detach(), v.detach()))
+            }
+            else {
+                cache[block_idx] = Some((k.clone(), v.clone()))
+            }
         }
         //println!("k shape (b): {:?}", k.shape());
         //println!("v shape (b): {:?}", v.shape());
@@ -494,6 +507,12 @@ impl CausalSelfAttention {
         };
         let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, hidden_size])?;
         let y = self.o_proj.forward(&y)?;
+        let y = if detach_grads {
+            y.detach()
+        }
+        else {
+            y
+        };
         Ok(y)
     }
 
@@ -615,13 +634,19 @@ struct Block {
 }
 
 impl Block {
-    fn forward(&self, x: &Tensor, index_pos: usize, block_idx: usize, cache: &Cache) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, index_pos: usize, block_idx: usize, cache: &Cache, detach_grads: bool) -> Result<Tensor> {
         let _enter = self.span.enter();
         let residual = x;
         let x = self.rms_1.forward(x)?;
-        let x = (self.attn.forward(&x, index_pos, block_idx, cache)? + residual)?;
+        let x = (self.attn.forward(&x, index_pos, block_idx, cache, detach_grads)? + residual)?;
         let residual = &x;
         let x = (self.mlp.forward(&self.rms_2.forward(&x)?)? + residual)?;
+        let x = if detach_grads {
+            x.detach()
+        }
+        else {
+            x
+        };
         Ok(x)
     }
 
@@ -696,12 +721,12 @@ impl Llama {
         let (_b_sz, seq_len) = x.dims2()?;
         let mut x = self.wte.forward(x)?;
         for (block_idx, block) in self.blocks.iter().enumerate() {
-            x = block.forward(&x, index_pos, block_idx, cache)?;
+            x = block.forward(&x, index_pos, block_idx, cache, true)?;
         }
         let x = self.ln_f.forward(&x)?;
         let x = x.i((.., seq_len - 1, ..))?;
         let logits = self.lm_head.forward(&x)?;
-        logits.to_dtype(DType::F32)
+        logits.detach().to_dtype(DType::F32)
     }
 
     pub fn forward_for_training(&self, x: &Tensor, index_pos: usize, cache: &Cache) -> Result<Tensor> {
@@ -709,7 +734,7 @@ impl Llama {
         let mut x = self.wte.forward(x)?;
         //println!("after wte: {}", x.backward().unwrap().get_ids().collect::<Vec<_>>().len());
         for (block_idx, block) in self.blocks.iter().enumerate() {
-            x = block.forward(&x, index_pos, block_idx, cache)?;
+            x = block.forward(&x, index_pos, block_idx, cache, false)?;
             //println!("after block {}: {}", block_idx, x.backward().unwrap().get_ids().collect::<Vec<_>>().len());
         }
         //println!("after blocks: {}", x.backward().unwrap().get_ids().collect::<Vec<_>>().len());
