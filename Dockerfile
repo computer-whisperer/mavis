@@ -21,7 +21,8 @@ RUN apt update && apt install -y \
     libvulkan1 \
     libvulkan-dev \
     vulkan-tools \
-    libnvidia-gl-565
+    libnvidia-gl-565 \
+    protobuf-compiler
 RUN rustup default nightly
 
 RUN useradd -rm -d /home/ubuntu -s /bin/bash -g root -G sudo -u 1001 test
@@ -37,5 +38,9 @@ COPY sshd_config /etc/ssh/
 
 COPY . .
 RUN cargo build
+
+USER ubuntu
+RUN rustup default nightly
+USER root
 
 COPY nvidia_icd.json /etc/vulkan/icd.d

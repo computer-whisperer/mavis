@@ -15,8 +15,8 @@ path = "src/vision_demo.rs"
 argparse = "0.2.1"
 futures = "0.3.31"
 bytes = "1.9.0"
-mumble-protocol = "0.4.1"
-tokio-util = {version= "0.6", features=["net", "codec"] }
+mumble-protocol-2x = "0.6.0"
+tokio-util = {version= "0.7.13", features=["net", "codec"] }
 tokio-native-tls = "0.3.1"
 ollama-rs = "0.2.1"
 tokio = { version = "1.42", features = ["rt", "rt-multi-thread", "macros"] }
@@ -39,10 +39,6 @@ candle-transformers = { path="libs/candle/candle-transformers", version = "0.8.2
 candle-core = { path="libs/candle/candle-core", version = "0.8.2" }
 candle-nn = { path="libs/candle/candle-nn", version = "0.8.2" }
 candle-examples = { path="libs/candle/candle-examples", version = "0.8.1" }
-
-candle-lora = {path="libs/candle-lora/candle-lora"}
-candle-lora-macro = {path="libs/candle-lora/candle-lora-macro"}
-candle-lora-transformers = {path="libs/candle-lora/candle-lora-transformers"}
 
 
 [features]

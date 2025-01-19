@@ -2,15 +2,15 @@ use std::net::{Ipv6Addr, SocketAddr};
 use bytes::Bytes;
 use futures::channel::oneshot;
 use crate::speech_to_text::SpeechToText;
-use mumble_protocol::crypt::ClientCryptState;
-use mumble_protocol::voice::{VoicePacket, VoicePacketPayload};
+use mumble_protocol_2x::crypt::ClientCryptState;
+use mumble_protocol_2x::voice::{VoicePacket, VoicePacketPayload};
 use std::collections::HashMap;
 use opus::Channels;
 use std::sync::Mutex;
 use std::fs;
 use std::time::{Duration};
 use futures::{SinkExt, StreamExt};
-use mumble_protocol::control::{msgs, ClientControlCodec, ControlPacket};
+use mumble_protocol_2x::control::{msgs, ClientControlCodec, ControlPacket};
 use regex::Regex;
 use tokio::net::TcpStream;
 use tokio::net::UdpSocket;
@@ -29,6 +29,7 @@ pub(crate) async fn connect(
     crypt_state_sender: mpsc::Sender<ClientCryptState>,
     new_rx_messages_tx: mpsc::Sender<(u32, String)>,
     mut new_tx_messages_rx: mpsc::Receiver<String>,
+    mut must_resync_crypt_rx: mpsc::Receiver<()>,
     user_map: &Mutex<HashMap<u32, String>>,
 ) {
 
@@ -58,12 +59,12 @@ pub(crate) async fn connect(
     let (mut sink, mut stream) = ClientControlCodec::new().framed(tls_stream).split();
 
     // Version
-    let mut msg = mumble_protocol::control::msgs::Version::new();
-    msg.set_version(0x01000000);
+    let mut msg = mumble_protocol_2x::control::msgs::Version::new();
+    msg.set_version_v1(0x01000000);
     sink.send(msg.into()).await.unwrap();
 
     // Authenticate
-    let mut msg = mumble_protocol::control::msgs::Authenticate::new();
+    let mut msg = mumble_protocol_2x::control::msgs::Authenticate::new();
     msg.set_username(user_name);
     if let Some(pass_word) = pass_word {
         msg.set_password(pass_word);
@@ -77,6 +78,10 @@ pub(crate) async fn connect(
     let mut current_channel_id = 0;
     let mut current_session_id = 0;
 
+    let mut stored_key = None;
+    let mut stored_client_nonce = None;
+    let mut stored_server_nonce = None;
+
     // Handle incoming packets
     loop {
         tokio::select! {
@@ -89,22 +94,25 @@ pub(crate) async fn connect(
                             println!("Long message received ({} chars), skipping", text.len());
                         }
                         else {
-                            new_rx_messages_tx.send((msg.get_actor(), text)).await.unwrap();
+                            new_rx_messages_tx.send((msg.actor(), text)).await.unwrap();
                         }
                     }
                     ControlPacket::CryptSetup(msg) => {
                         // Wait until we're fully connected before initiating UDP voice
-                        println!("CryptSetup received");
+                        println!("CryptSetup received: {}, {}, {}", msg.key().len(), msg.client_nonce().len(), msg.server_nonce().len() );
+                        if msg.key().len() > 0 {
+                            stored_key = Some(msg.key().try_into().expect("Server sent private key with incorrect size"))
+                        }
+                        if msg.client_nonce().len() > 0 {
+                            stored_client_nonce = Some(msg.client_nonce().try_into().expect("Server sent client_nonce with incorrect size"))
+                        }
+                        if msg.server_nonce().len() > 0 {
+                            stored_server_nonce = Some(msg.server_nonce().try_into().expect("Server sent server_nonce with incorrect size"))
+                        }
                         crypt_state = Some(ClientCryptState::new_from(
-                            msg.get_key()
-                                .try_into()
-                                .expect("Server sent private key with incorrect size"),
-                            msg.get_client_nonce()
-                                .try_into()
-                                .expect("Server sent client_nonce with incorrect size"),
-                            msg.get_server_nonce()
-                                .try_into()
-                                .expect("Server sent server_nonce with incorrect size"),
+                            stored_key.unwrap(),
+                            stored_client_nonce.unwrap(),
+                            stored_server_nonce.unwrap(),
                         ));
 
                         crypt_state_sender.send(
@@ -113,7 +121,7 @@ pub(crate) async fn connect(
                                 .expect("Server didn't send us any CryptSetup packet!")).await.unwrap();
                     }
                     ControlPacket::ServerSync(sync_data) => {
-                        current_session_id = sync_data.get_session();
+                        current_session_id = sync_data.session();
                         println!("Logged in!");
                     }
                     ControlPacket::ChannelState(state) => {
@@ -122,18 +130,41 @@ pub(crate) async fn connect(
                     ControlPacket::UserState(state) => {
                         println!("UserState received");
                         if state.has_name() {
-                            let user_name = state.get_name().to_string();
-                            let user_id = state.get_session();
+                            let user_name = state.name().to_string();
+                            let user_id = state.session();
                             user_map.lock().unwrap().insert(user_id, user_name);
                         }
                     }
                     ControlPacket::Reject(msg) => {
                         println!("Login rejected: {:?}", msg);
                     }
-                    _ => {},
+                    ControlPacket::Version(_) => {println!("Received version packet");}
+                    ControlPacket::UDPTunnel(_) => {println!("Received UDP Tunnel Packet");}
+                    ControlPacket::Authenticate(_) => {println!("Received Authenticate Packet");}
+                    ControlPacket::Ping(_) => {
+                        //println!("Received Ping Packet");
+                    }
+                    ControlPacket::ChannelRemove(_) => {println!("Received Channel Remove Packet");}
+                    ControlPacket::UserRemove(_) => {println!("Received User Remove Packet");}
+                    ControlPacket::BanList(_) => {println!("Received BanList Packet");}
+                    ControlPacket::PermissionDenied(_) => {println!("Received Permission Denied Packet");}
+                    ControlPacket::ACL(_) => {println!("Received ACL Packet");}
+                    ControlPacket::QueryUsers(_) => {println!("Received Query Users Packet");}
+                    ControlPacket::ContextActionModify(_) => {println!("Received Context Action Modify Packet");}
+                    ControlPacket::ContextAction(_) => {println!("Received Context Action Packet");}
+                    ControlPacket::UserList(_) => {println!("Received User List Packet");}
+                    ControlPacket::VoiceTarget(_) => {println!("Received Voice Target Packet");}
+                    ControlPacket::PermissionQuery(_) => {println!("Received Permission Query Packet");}
+                    ControlPacket::CodecVersion(_) => {println!("Received Codec Version Packet");}
+                    ControlPacket::UserStats(_) => {println!("Received User Stats Packet");}
+                    ControlPacket::RequestBlob(_) => {println!("Received Request Blob Packet");}
+                    ControlPacket::ServerConfig(_) => {println!("Received Server Config Packet");}
+                    ControlPacket::SuggestConfig(_) => {println!("Received Suggest Config Packet");}
+                    ControlPacket::Other(_) => {println!("Received Other Packet");}
+                    _ => {}
                 }
             }
-            _ = sleep(Duration::from_secs(5)) => {
+            _ = sleep(Duration::from_secs(1)) => {
                 let mut ping = msgs::Ping::new();
                 sink.send(ControlPacket::Ping(Box::new(ping))).await.unwrap();
             }
@@ -144,8 +175,17 @@ pub(crate) async fn connect(
                 sink.send(ControlPacket::TextMessage (Box::new(message))).await.unwrap();
                 sink.flush().await.unwrap();
             }
+            _ = must_resync_crypt_rx.recv() => {
+                let mut crypt_setup = msgs::CryptSetup::new();
+                println!("Requesting new crypt state!");
+                sink.send(ControlPacket::CryptSetup(Box::new(crypt_setup))).await.unwrap();
+                sink.flush().await.unwrap();
+                println!("Requested new crypt state!");
+            }
         }
     }
+
+    eprintln!("Client disconnected!!!!!");
 }
 
 pub(crate) async fn handle_udp(
@@ -153,6 +193,7 @@ pub(crate) async fn handle_udp(
     mut crypt_state_recv: mpsc::Receiver<ClientCryptState>,
     mut speech_to_text: SpeechToText,
     mut new_stt_tx: mpsc::Sender<(u32, String)>,
+    mut must_resync_crypt_tx: mpsc::Sender<()>,
 ) {
     let re = Regex::new(r"<[^>]*>").unwrap();
 
@@ -190,19 +231,29 @@ pub(crate) async fn handle_udp(
     let mut opus_decoders = HashMap::<u32, opus::Decoder>::new();
     let mut pcm_buffers = HashMap::<u32, Vec::<f32>>::new();
 
+    let mut error_count = 0;
+
+    let mut last_resync_request_time = Instant::now();
+
     let mut next_ping_time = Instant::now();
     loop {
         tokio::select! {
             Some(new_crypt_state) = crypt_state_recv.recv() => {
+                println!("Adding new crypt state");
                 *udp_framed.codec_mut() = new_crypt_state;
+                last_resync_request_time = Instant::now();
             }
             Some(packet) = udp_framed.next() => {
                 let (packet, src_addr) = match packet {
                     Ok(packet) => packet,
                     Err(err) => {
-                        eprintln!("Got an invalid UDP packet: {}", err);
+                        //eprintln!("Got an invalid UDP packet: {:?}", err);
                         // To be expected, considering this is the internet, just ignore it
-                        return
+                        if last_resync_request_time.elapsed() > Duration::from_secs(15) {
+                            println!("Requesting crypt resync...");
+                            must_resync_crypt_tx.send(()).await.unwrap();
+                            last_resync_request_time = Instant::now();
+                        }
                         continue
                     }
                 };
@@ -249,8 +300,9 @@ pub(crate) async fn handle_udp(
                                     for segment in res {
                                         if segment.dr.no_speech_prob < 0.3 {
                                             // Strip all special tokens (like <thing>)
-                                            let text = re.replace_all(segment.dr.text.as_str(), "").into_owned();
-                                            new_stt_tx.send((session_id, text)).await.unwrap();
+                                            //let text = re.replace_all(segment.dr.text.as_str(), "").into_owned();
+                                            //println!("Before: {}, after: {}", segment.dr.text, text);
+                                            new_stt_tx.send((session_id, segment.dr.text)).await.unwrap();
                                        }
                                     }
                                 }
@@ -265,7 +317,7 @@ pub(crate) async fn handle_udp(
             _ = sleep_until(next_ping_time) => {
                 // Send a Ping packet
                 udp_framed.send((VoicePacket::Ping{timestamp: 10}, server_addr)).await.unwrap();
-                next_ping_time = Instant::now() + Duration::from_secs(2);
+                next_ping_time = Instant::now() + Duration::from_secs(1);
             }
         }
     }

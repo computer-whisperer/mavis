@@ -1,6 +1,3 @@
-[submodule "libs/candle-lora"]
-	path = libs/candle-lora
-	url = http://github.com/computer-whisperer/candle-lora
 [submodule "libs/candle"]
 	path = libs/candle
-	url = https://github.com/huggingface/candle
+	url = https://github.com/computer-whisperer/candle

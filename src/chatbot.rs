@@ -130,16 +130,14 @@ impl ChatBot {
     }
 
     fn roll_text_generation_context(&mut self) {
-        let current_context_len = self.text_generation.get_context_len();
-        if current_context_len > 256 {
-            println!("Training lora! ({} tokens)", current_context_len);
+        if self.text_generation.get_context_len() > self.text_generation.get_max_inference_context_tokens()-128 {
+            println!("Training lora!");
             let context_string = self.text_generation.get_context_string();
-            self.text_generation.train(context_string.as_str(), 0.00005).unwrap();
+            self.text_generation.train(context_string.as_str(), 0.00002).unwrap();
             self.text_generation.clear_context();
 
-            let records_to_keep = 32.min(self.loaded_context.len()/4);
-            // Delete all but the most recent records
-            self.loaded_context.drain(0..(self.loaded_context.len() - records_to_keep));
+            // Delete oldest 1/4 records
+            self.loaded_context.drain(0..10);
 
             // load the model with the remaining context
             for record in &self.loaded_context {

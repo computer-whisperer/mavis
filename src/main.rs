@@ -5,7 +5,7 @@ use argparse::StoreTrue;
 use futures::join;
 use futures::StreamExt;
 use futures::SinkExt;
-use mumble_protocol::crypt::ClientCryptState;
+use mumble_protocol_2x::crypt::ClientCryptState;
 use std::convert::Into;
 use std::convert::TryInto;
 use std::net::ToSocketAddrs;
@@ -26,8 +26,22 @@ use text_generation::TextGeneration;
 use crate::speech_to_text::SpeechToText;
 
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 10)]
 async fn main() {
+    println!(
+        "avx: {}, neon: {}, simd128: {}, f16c: {}",
+        candle_core::utils::with_avx(),
+        candle_core::utils::with_neon(),
+        candle_core::utils::with_simd128(),
+        candle_core::utils::with_f16c()
+    );
+
+    //#[cfg(feature = "cuda")]
+    //candle_core::quantized::cuda::set_force_dmmv(args.force_dmmv);
+
+    candle_core::cuda::set_gemm_reduced_precision_f16(true);
+    candle_core::cuda::set_gemm_reduced_precision_bf16(true);
+
     // construct a subscriber that prints formatted traces to stdout
     let subscriber = tracing_subscriber::FmtSubscriber::new();
     // use that subscriber to process traces emitted after this point
@@ -44,26 +58,26 @@ async fn main() {
     };
     let mut text_generation = TextGeneration::new(device_a.clone()).unwrap();
 
+
+    //text_generation.run("fibonacci sequence: 1 1 2 3").unwrap();
+    //text_generation.add_context("This is a long").unwrap();
+    //text_generation.run("This is a different").unwrap();
+    //return;
 /*
-    text_generation.run("This is a long").unwrap();
-    text_generation.add_context("This is a long").unwrap();
-    text_generation.run("This is a different").unwrap();
-    return;*/
-    /*
     text_generation.clear_context();
     for _ in 0..10 {
-        text_generation.train("This is a long, mysterious string that I want to burn hard into the llm's memory. What happens now?").unwrap();
+        text_generation.train("This is a long, mysterious string that I want to burn hard into the llm's memory. What happens now?", 0.0001).unwrap();
     }
     text_generation.run("This is a long");
     text_generation.clear_context();
     text_generation.run("This is a different");
     text_generation.clear_context();
-    return;
-*/
+    return;*/
+
     let mut chat_bot = ChatBot::new(text_generation);
     chat_bot.load_context();
 
-    chat_bot.text_generation.clear_context();
+    //chat_bot.text_generation.clear_context();
 
     let mut speech_to_text = SpeechToText::new(device_b).unwrap();
 
@@ -105,6 +119,7 @@ async fn main() {
     let (mut new_rx_messages_tx, mut new_rx_messages_rx) = mpsc::channel::<(u32, String)>(32);
     let (mut new_tx_messages_tx, mut new_tx_messages_rx) = mpsc::channel::<String>(32);
     let (mut new_stt_tx, mut new_stt_rx) = mpsc::channel::<(u32, String)>(32);
+    let (mut must_resync_crypt_tx, mut must_resync_crypt_rx) = mpsc::channel::<()>(1);
 
     let user_map = Mutex::<HashMap<u32, String>>::new(HashMap::new());
 
@@ -119,9 +134,13 @@ async fn main() {
             crypt_state_sender,
             new_rx_messages_tx,
             new_tx_messages_rx,
+            must_resync_crypt_rx,
             &user_map
         ),
-        mumble_connector::handle_udp(server_addr, crypt_state_receiver, speech_to_text, new_stt_tx),
+        mumble_connector::handle_udp(
+            server_addr, crypt_state_receiver, speech_to_text, new_stt_tx,
+            must_resync_crypt_tx,
+        ),
         chat_bot.run(new_rx_messages_rx, new_stt_rx, &user_map, new_tx_messages_tx)
     );
 }

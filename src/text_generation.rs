@@ -1,16 +1,14 @@
+use std::fmt::{Debug, Display, Formatter};
 use anyhow::{Error as E, Result};
-use candle_core::{Device, IndexOp, Tensor, Var};
+use candle_core::{Device, IndexOp, Tensor};
 use candle_core::DType;
-use candle_core::utils::cuda_is_available;
+use candle_core::quantized::{gguf_file};
 use candle_examples::token_output_stream::TokenOutputStream;
-//use candle_nn::var_builder::VarBuilder;
 use candle_transformers::generation::LogitsProcessor;
 use candle_transformers::models::llama::{LlamaEosToks};
-use crate::llama::{Cache, Config, Llama, LlamaConfig};
-use candle_lora::{LoraConfig, LoraLinearConfig, LoraEmbeddingConfig};
-use candle_lora_transformers::varbuilder_utils::from_mmaped_safetensors;
+use crate::llama::{Cache, Llama, LlamaConfig, LoraConfig};
 use tokenizers::tokenizer::Tokenizer;
-use candle_nn::{ops, AdamW, Optimizer, VarBuilder, VarMap, SGD};
+use candle_nn::{ops, AdamW, Optimizer, VarBuilder};
 use crate::hybrid_var_map::{HybridVarMap, VarOrTensor};
 
 pub struct TextGeneration {
@@ -22,7 +20,7 @@ pub struct TextGeneration {
     context_text: String,
     num_context_tokens_processed: usize,
     cache: Cache,
-    config: Config,
+    use_flash_attn: bool,
     repeat_penalty: f32,
     repeat_last_n: usize,
     eos_token_id: LlamaEosToks,
@@ -32,47 +30,108 @@ pub struct TextGeneration {
     max_train_context_tokens: usize
 }
 
+#[derive(Debug)]
+enum TextGenerationError {
+    ContextTooLong
+}
+
+
+impl Display for TextGenerationError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TextGenerationError::ContextTooLong => {write!(f, "Context Too Long")}
+        }
+    }
+}
+
+impl std::error::Error for TextGenerationError{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        None
+    }
+}
+
+
 impl TextGeneration {
 
     pub(crate) fn new(device: Device) -> Result<Self, Box<dyn std::error::Error>> {
-        let base_model_dir = "/ceph-fuse/public/neural_models/llms/Meta-Llama-3.1-8B";
-        let tokenizer_filename = "/ceph-fuse/public/neural_models/llms/Meta-Llama-3.1-8B/tokenizer.json";
-        let model_filenames = [
-            "/ceph-fuse/public/neural_models/llms/Meta-Llama-3.1-8B/model-00001-of-00004.safetensors",
-            "/ceph-fuse/public/neural_models/llms/Meta-Llama-3.1-8B/model-00002-of-00004.safetensors",
-            "/ceph-fuse/public/neural_models/llms/Meta-Llama-3.1-8B/model-00003-of-00004.safetensors",
-            "/ceph-fuse/public/neural_models/llms/Meta-Llama-3.1-8B/model-00004-of-00004.safetensors"
-        ];
-        let config_filename = "/ceph-fuse/public/neural_models/llms/Meta-Llama-3.1-8B/config.json";
+        let model_path =  "/ceph-fuse/public/neural_models/llms/Meta-Llama-3-8B.Q4_K_M.gguf";
+        //let model_path =  "/ceph-fuse/public/neural_models/llms/Meta-Llama-3.1-8B";
+        // If it's a dir, it's probably a safetensors import
+        let model_path = std::path::Path::new(model_path);
+        let is_safetensors_import = model_path.is_dir();
+
         let dtype = if device.supports_bf16() {
             DType::BF16
         } else {
             DType::F32
         };
-        let tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(E::msg)?;
-        let tokenizer = TokenOutputStream::new(tokenizer);
-        let config: LlamaConfig = serde_json::from_slice(&std::fs::read(config_filename)?)?;
-        let config = config.into_config(false);
-        let mut var_map = HybridVarMap::new();
-        {
-            let mut ws = var_map.data().lock().unwrap();
 
-            let tensors = unsafe { candle_core::safetensors::MmapedSafetensors::multi(&model_filenames)? };
-            for (name, _) in tensors.tensors() {
-                let tensor = tensors
-                    .load(&name, &device)?
-                    .to_device(&device)?
-                    .to_dtype(dtype)?;
-                ws.insert(name.clone(), VarOrTensor::Tensor(tensor));
+
+        let (mut model, tokenizer) = if is_safetensors_import {
+            let tokenizer_filename = model_path.join("tokenizer.json");
+            let model_filenames = [
+                model_path.join("model-00001-of-00004.safetensors"),
+                model_path.join("model-00002-of-00004.safetensors"),
+                model_path.join("model-00003-of-00004.safetensors"),
+                model_path.join("model-00004-of-00004.safetensors")
+            ];
+            let config_filename = model_path.join("config.json");
+
+            let tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(E::msg)?;
+            let tokenizer = TokenOutputStream::new(tokenizer);
+            let config: LlamaConfig = serde_json::from_slice(&std::fs::read(config_filename)?)?;
+            let config = config.into_config();
+
+            let mut var_map = HybridVarMap::new();
+            {
+                let mut ws = var_map.data().lock().unwrap();
+
+                let tensors = unsafe { candle_core::safetensors::MmapedSafetensors::multi(&model_filenames)? };
+                for (name, _) in tensors.tensors() {
+                    let tensor = tensors
+                        .load(&name, &device)?
+                        .to_device(&device)?
+                        .to_dtype(dtype)?;
+                    ws.insert(name.clone(), VarOrTensor::Tensor(tensor));
+                }
             }
+            let vb = VarBuilder::from_backend(Box::new(var_map.clone()), dtype, device.clone());
+
+            let model = Llama::new_from_varbuilder(vb, config, dtype)?;
+
+            (model, tokenizer)
         }
-        let vb = VarBuilder::from_backend(Box::new(var_map.clone()), dtype, device.clone());
-        let cache = Cache::new(true, dtype, &config, &device)?;
+        else {
+            let mut file = std::fs::File::open(&model_path)?;
+            let gguf_content = gguf_file::Content::read(&mut file)
+                .map_err(|e| e.with_path(model_path))?;
+
+            /*
+            let tokens = gguf_content.metadata.get("tokenizer.ggml.tokens").unwrap().to_vec().unwrap();
+            for i in 0..100 {
+                println!("token {} : {}", i, tokens[i].to_string().unwrap())
+            }*/
+            //println!("bos token id: {}", gguf_content.metadata.get("tokenizer.ggml.bos_token_id").unwrap().to_u32().unwrap());
+            //println!("rope dimension count: {}", gguf_content.metadata.get("llama.rope.dimension_count").unwrap().to_u32().unwrap());
+
+            let model = Llama::new_from_gguf(&device, gguf_content, &mut file, DType::F32)?;
+
+            // temp
+            let tokenizer_filename = model_path.join("/ceph-fuse/public/neural_models/llms/Meta-Llama-3.1-8B/tokenizer.json");
+            let tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(E::msg)?;
+            let tokenizer = TokenOutputStream::new(tokenizer);
+
+            (model, tokenizer)
+        };
+
         let r = 256;
-        let lora_config = LoraConfig::new(r, (r as f64)*2.0, None);
-        let lora_linear_config = LoraLinearConfig::new(config.hidden_size, config.hidden_size);
-        let lora_embedding_config = LoraEmbeddingConfig::new(config.vocab_size, config.hidden_size);
-        let model = Llama::load(vb, &cache, &config, false, lora_config, lora_linear_config, lora_embedding_config)?;
+        let lora_config = LoraConfig::new(r, (r as f64)*2.0);
+        let mut lora_var_map = HybridVarMap::new();
+        let vb = VarBuilder::from_backend(Box::new(lora_var_map.clone()), dtype, device.clone());
+        model.add_lora(&lora_config, vb)?;
+
+        let cache = model.new_cache(&device, true)?;
+
         let logits_processor = LogitsProcessor::new(299792458, Some(1.0), None);
         //let bos_token_id = config.bos_token_id.unwrap();
         let bos_token_id = 128000;
@@ -85,12 +144,12 @@ impl TextGeneration {
             ..Default::default()
         };
 
-        let optimizer = AdamW::new(var_map.all_vars(), adamw_params).unwrap();
+        let optimizer = AdamW::new(lora_var_map.all_vars(), adamw_params).unwrap();
         Ok(Self {
             model,
             device,
             cache,
-            config,
+            use_flash_attn: false,
             context_tokens: vec![bos_token_id],
             context_text: String::new(),
             num_context_tokens_processed: 0,
@@ -101,8 +160,8 @@ impl TextGeneration {
             bos_token_id,
             eos_token_id,
             optimizer,
-            max_inference_context_tokens: 400,
-            max_train_context_tokens: 250
+            max_inference_context_tokens: 2048,
+            max_train_context_tokens: 350
         })
     }
 
@@ -157,6 +216,14 @@ impl TextGeneration {
         self.context_tokens.len()
     }
 
+    pub(crate) fn get_max_train_context_tokens(&self) -> usize {
+        self.max_train_context_tokens
+    }
+
+    pub(crate) fn get_max_inference_context_tokens(&self) -> usize {
+        self.max_inference_context_tokens
+    }
+
     pub fn get_context_string(&self) -> String {
         self.context_text.clone()
     }
@@ -171,7 +238,7 @@ impl TextGeneration {
         self.num_context_tokens_processed = 0;
 
         if self.context_tokens.len() > self.max_inference_context_tokens {
-            self.context_tokens.truncate(self.max_inference_context_tokens)
+            return Err(TextGenerationError::ContextTooLong.into());
         }
 
         let mut local_tokens_processed = 0usize;
@@ -186,14 +253,14 @@ impl TextGeneration {
                 if self.cache.use_kv_cache {
                     let ctxt = &local_context_tokens[local_tokens_processed..];
                     let input = Tensor::new(ctxt, &self.device)?.unsqueeze(0)?;
-                    let res = self.model.forward(&input, local_tokens_processed, &self.cache)?;
+                    let res = self.model.forward(&input, local_tokens_processed, &self.cache, self.use_flash_attn)?;
                     local_tokens_processed = local_context_tokens.len();
                     res
                 }
                 else {
                     let ctxt = &local_context_tokens[..];
                     let input = Tensor::new(ctxt, &self.device)?.unsqueeze(0)?;
-                    let res = self.model.forward(&input, 0, &self.cache)?;
+                    let res = self.model.forward(&input, 0, &self.cache, self.use_flash_attn)?;
                     res
                 }
             };
@@ -271,7 +338,7 @@ impl TextGeneration {
         self.context_tokens.append(&mut new_tokens);
 
         if self.context_tokens.len() > self.max_inference_context_tokens {
-            self.context_tokens.truncate(self.max_inference_context_tokens)
+            return Err(TextGenerationError::ContextTooLong.into());
         }
 
         if self.num_context_tokens_processed+1 < self.context_tokens.len() {
@@ -290,14 +357,14 @@ impl TextGeneration {
                 if self.cache.use_kv_cache {
                     let ctxt = &self.context_tokens[self.num_context_tokens_processed..];
                     let input = Tensor::new(ctxt, &self.device)?.unsqueeze(0)?;
-                    let res = self.model.forward(&input, self.num_context_tokens_processed, &self.cache)?;
+                    let res = self.model.forward(&input, self.num_context_tokens_processed, &self.cache, self.use_flash_attn)?;
                     self.num_context_tokens_processed = self.context_tokens.len();
                     res
                 }
                 else {
                     let ctxt = &self.context_tokens[..];
                     let input = Tensor::new(ctxt, &self.device)?.unsqueeze(0)?;
-                    let res = self.model.forward(&input, 0, &self.cache)?;
+                    let res = self.model.forward(&input, 0, &self.cache, self.use_flash_attn)?;
                     res
                 }
             };

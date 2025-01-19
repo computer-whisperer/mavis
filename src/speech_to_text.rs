@@ -27,6 +27,10 @@ pub struct Segment {
     pub(crate) dr: DecodingResult,
 }
 
+pub struct SpeechToTextInputStream {
+
+}
+
 pub struct SpeechToText {
     device: Device,
     model: Whisper,
@@ -54,7 +58,8 @@ pub fn token_id(tokenizer: &Tokenizer, token: &str) -> candle::Result<u32> {
 
 impl SpeechToText {
     pub fn new(device: Device) -> anyhow::Result<Self> {
-        let base_model_dir = "/ceph-fuse/public/neural_models/speech_to_text/whisper-medium.en";
+        //let base_model_dir = "/ceph-fuse/public/neural_models/speech_to_text/whisper-medium.en";
+        let base_model_dir = "/ceph-fuse/public/neural_models/speech_to_text/whisper-large-v3";
         let tokenizer_filename = format!("{}/tokenizer.json", base_model_dir);
         let model_filenames = [
             format!("{}/model.safetensors", base_model_dir),
@@ -141,10 +146,9 @@ impl SpeechToText {
         let mut no_speech_prob = f64::NAN;
 
         let mut tokens = vec![self.sot_token];
+        tokens.push(token_id(&self.tokenizer, "<|en|>")?);
         tokens.push(self.transcribe_token);
-        if !self.timestamps {
-            tokens.push(self.no_timestamps_token);
-        }
+        tokens.push(self.no_timestamps_token);
         for i in 0..sample_len {
             let tokens_t = Tensor::new(tokens.as_slice(), mel.device())?;
 

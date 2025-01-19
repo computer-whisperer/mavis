@@ -1,17 +1,23 @@
 //! The LLama2 model.
 
-use candle_core::{DType, Device, IndexOp, Result, Tensor, D};
-use candle_lora::{
-    EmbeddingLayerLike, LinearLayerLike, LoraConfig, LoraEmbeddingConfig, LoraLinearConfig,
-    Saveable,
-};
-use candle_lora_macro::{replace_layer_fields, AutoLoraConvert};
-use candle_nn::{Embedding, Module, VarBuilder, Linear};
+use candle_core::{DType, Device, IndexOp, Shape, Tensor, D};
+use candle_nn::{Embedding, Module, VarBuilder, Linear, init};
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fs::File;
 use std::sync::{Arc, Mutex};
+use anyhow::Context;
+use candle_core::quantized::{gguf_file, QMatMul, QTensor};
+use candle_transformers::quantized_nn::Linear as QLinear;
 
 pub const MAX_SEQ_LEN: usize = 4096;
+
+fn dump_tensor(x: &Tensor) {
+    let mut file = File::create("/ceph-fuse/public/k8s/mavis/data/debug/dump-1.bin").unwrap();
+    let x = x.to_dtype(DType::F32).unwrap().to_device(&Device::Cpu).unwrap();
+    println!("Dumping tensor of shape {:?}", x.shape());
+    x.write_bytes(&mut file).unwrap();
+}
 
 #[derive(Deserialize)]
 pub struct LlamaConfig {
@@ -31,7 +37,7 @@ fn default_rope() -> f32 {
 }
 
 impl LlamaConfig {
-    pub fn into_config(self, use_flash_attn: bool) -> Config {
+    pub fn into_config(self) -> Config {
         Config {
             hidden_size: self.hidden_size,
             intermediate_size: self.intermediate_size,
@@ -41,7 +47,6 @@ impl LlamaConfig {
             num_key_value_heads: self.num_key_value_heads.unwrap_or(self.num_attention_heads),
             rms_norm_eps: self.rms_norm_eps,
             rope_theta: self.rope_theta,
-            use_flash_attn,
         }
     }
 }
@@ -53,72 +58,147 @@ pub struct Config {
     pub num_hidden_layers: usize,
     pub num_attention_heads: usize,
     pub num_key_value_heads: usize,
-    pub use_flash_attn: bool,
     pub rms_norm_eps: f64,
     pub rope_theta: f32,
 }
 
-impl Config {
-    pub fn config_7b_v1(use_flash_attn: bool) -> Self {
-        Self {
-            hidden_size: 4096,
-            intermediate_size: 11008,
-            vocab_size: 32000,
-            num_hidden_layers: 32,
-            num_attention_heads: 32,
-            num_key_value_heads: 32,
-            use_flash_attn,
-            rms_norm_eps: 1e-6,
-            rope_theta: 10_000.0,
-        }
+pub struct GGUFReader<'a, R: std::io::Seek + std::io::Read> {
+    ct: gguf_file::Content,
+    reader: &'a mut R
+}
+
+impl<'a, R: std::io::Seek + std::io::Read> GGUFReader<'a, R> {
+    pub fn new(    ct: gguf_file::Content,
+                   reader: &'a mut R) -> Self {
+        Self { ct, reader}
     }
 
-    pub fn config_7b_v2(use_flash_attn: bool) -> Self {
-        Self {
-            hidden_size: 4096,
-            intermediate_size: 11008,
-            vocab_size: 32000,
-            num_hidden_layers: 32,
-            num_attention_heads: 32,
-            num_key_value_heads: 32,
-            use_flash_attn,
-            rms_norm_eps: 1e-5,
-            rope_theta: 10_000.0,
+    pub fn get_qtensor(&mut self, device: &Device, prefix: &str, name: &str) -> anyhow::Result<QTensor> {
+        let path = format!("{}.{}", prefix, name);
+        let res = self.ct.tensor(self.reader, path.as_str(), device)?;
+        Ok(res)
+    }
+
+    pub fn get_metadata(&mut self, path: &str) -> anyhow::Result<&gguf_file::Value> {
+        self.ct.metadata.get(path).context("did not find metadata entry")
+    }
+
+    pub fn print_metadata(&self) {
+        println!("Metadata keys:");
+        for key in self.ct.metadata.keys() {
+            println!("{key}");
+        }
+        println!("Layer keys:");
+        for layer in self.ct.tensor_infos.keys() {
+            println!("{}", layer);
         }
     }
 }
 
-// We wrap the `LlamaLinear` layer here to add some tracing so that it's easier to profile the resulting
-// model.
-#[replace_layer_fields]
-#[derive(Debug, AutoLoraConvert)]
+pub struct LoraConfig {
+    rank: usize,
+    alpha: f64,
+}
+
+impl LoraConfig {
+    pub fn new(rank: usize, alpha: f64) -> Self {
+        Self { rank, alpha }
+    }
+}
+
+pub struct LoraLayer {
+    ff_a: Linear,
+    ff_b: Linear,
+    scale: Option<f64>,
+}
+
+impl LoraLayer {
+    pub fn new(in_dim: usize, out_dim: usize, config: &LoraConfig, vb: VarBuilder, dtype: DType) -> candle_core::Result<Self> {
+        let ff_a = Linear::new(vb.pp("a").get_with_hints_dtype(
+            (config.rank, in_dim),
+            "weight",
+            init::DEFAULT_KAIMING_NORMAL,
+            dtype
+        )?, None);
+        let ff_b = Linear::new(vb.pp("b").get_with_hints_dtype(
+            (out_dim, config.rank),
+            "weight",
+            init::ZERO,
+            dtype
+        )?, None);
+        let scale = if config.rank > 0 {
+            Some(config.alpha / config.rank as f64)
+        } else {
+            None
+        };
+        Ok(LoraLayer {
+                ff_a,
+                ff_b,
+                scale
+        })
+    }
+
+    pub fn forward(&self, input: &Tensor, frozen_output: &Tensor) -> candle_core::Result<Tensor> {
+        let x = self.ff_a.forward(input)?;
+        let x = self.ff_b.forward(&x)?;
+        frozen_output + x*self.scale.unwrap_or(1.0)
+    }
+}
+
 pub struct LlamaLinear {
-    inner: Linear,
+    inner: QMatMul,
+    lora_layer: Option<LoraLayer>,
+    in_out_dtype: DType,
     span: tracing::Span,
 }
 
+impl LlamaLinear {
+    pub fn new_from_varbuilder(in_dim: usize, out_dim: usize, vb: VarBuilder, in_out_dtype: DType) -> anyhow::Result<Self> {
+        let span = tracing::span!(tracing::Level::TRACE, "linear");
+        let ws = vb.get((out_dim, in_dim), "weight")?;
+        Ok(Self{
+            inner: QMatMul::Tensor(ws),
+            lora_layer: None,
+            in_out_dtype,
+            span,
+        })
+    }
+
+    pub fn new_from_gguf<R: std::io::Seek + std::io::Read>(device: &Device, gguf: &mut GGUFReader<R>, prefix: &str, in_out_dtype: DType) -> anyhow::Result<Self> {
+        let span = tracing::span!(tracing::Level::TRACE, "linear");
+        let ws = gguf.get_qtensor(device, prefix, "weight")?;
+        Ok(Self{
+            inner: QMatMul::from_qtensor(ws)?,
+            lora_layer: None,
+            span,
+            in_out_dtype,
+        })
+    }
+
+    pub fn add_lora(&mut self, lora_config: &LoraConfig, vb: VarBuilder) -> candle_core::Result<()> {
+        let shape = match &self.inner {
+            QMatMul::QTensor(x) => {x.shape()}
+            QMatMul::Tensor(x) => {x.shape()}
+            QMatMul::TensorF16(x) => {x.shape()}
+        };
+        self.lora_layer = Some(LoraLayer::new(shape.dims()[1], shape.dims()[0], lora_config, vb, self.in_out_dtype)?);
+        Ok(())
+    }
+}
+
 impl Module for LlamaLinear {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+
+    fn forward(&self, x: &Tensor) ->  candle_core::Result<Tensor> {
         let _enter = self.span.enter();
-        self.inner.forward(x)
-    }
-}
+        let base_out = self.inner.forward(x)?;
 
-impl Saveable for LlamaLinear {
-    fn get_tensors(&self, _accum: &mut HashMap<String, Tensor>) {
-        unimplemented!()
-    }
-}
-
-impl LinearLayerLike for LlamaLinear {
-    fn bias(&self) -> Option<&Tensor> {
-        self.inner.bias()
-    }
-    fn weight(&self) -> &Tensor {
-        self.inner.weight()
-    }
-    fn shape(&self) -> &candle_core::Shape {
-        self.inner.shape()
+        //let mut val = self.inner.dequantize_f16();
+        if let Some(lora_layer) = &self.lora_layer {
+            lora_layer.forward(x, &base_out)
+        }
+        else {
+            Ok(base_out)
+        }
     }
 }
 
@@ -135,36 +215,8 @@ pub struct Cache {
 }
 
 impl Cache {
-    pub fn new(use_kv_cache: bool, dtype: DType, config: &Config, device: &Device) -> Result<Self> {
-        // precompute freqs_cis
-        let n_elem = config.hidden_size / config.num_attention_heads;
-        let theta: Vec<_> = (0..n_elem)
-            .step_by(2)
-            .map(|i| 1f32 / config.rope_theta.powf(i as f32 / n_elem as f32))
-            .collect();
-        let theta = Tensor::new(theta.as_slice(), device)?;
-        let idx_theta = Tensor::arange(0, MAX_SEQ_LEN as u32, device)?
-            .to_dtype(DType::F32)?
-            .reshape((MAX_SEQ_LEN, 1))?
-            .matmul(&theta.reshape((1, theta.elem_count()))?)?;
-        // This is different from the paper, see:
-        // https://github.com/huggingface/transformers/blob/6112b1c6442aaf7affd2b0676a1cd4eee30c45cf/src/transformers/models/llama/modeling_llama.py#L112
-        let idx_theta = Tensor::cat(&[&idx_theta, &idx_theta], D::Minus1)?;
-        let cos = idx_theta.cos()?.to_dtype(dtype)?;
-        let sin = idx_theta.sin()?.to_dtype(dtype)?;
-        let num_hidden_layers = config.num_hidden_layers;
-        Ok(Self {
-            masks: Arc::new(Mutex::new(HashMap::new())),
-            use_kv_cache,
-            kvs: Arc::new(Mutex::new(vec![None; num_hidden_layers])),
-            device: device.clone(),
-            cos,
-            sin,
-            num_hidden_layers
-        })
-    }
 
-    fn mask(&self, t: usize) -> Result<Tensor> {
+    fn mask(&self, t: usize) -> anyhow::Result<Tensor> {
         let mut masks = self.masks.lock().unwrap();
         if let Some(mask) = masks.get(&t) {
             Ok(mask.clone())
@@ -192,139 +244,40 @@ impl Cache {
     }
 }
 
-fn linear_with_lora(
-    size1: usize,
-    size2: usize,
-    vb_main: VarBuilder,
-    vb_lora: VarBuilder,
-    merge: bool,
-    lora_config: LoraConfig
-) -> Result<LlamaLinear> {
-    let span = tracing::span!(tracing::Level::TRACE, "linear");
-    let inner = candle_nn::linear_no_bias(size1, size2, vb_main)?;
-    let linear_config = LoraLinearConfig::new(size1, size2);
-    let mut this = LlamaLinear {
-        inner: Arc::new(inner),
-        span,
-    };
-    if merge {
-        this.get_merged_lora_model(
-            lora_config,
-            &vb_lora,
-            Some(linear_config),
-            None,
-            None,
-            None
-        )
-    }
-    else {
-        this.get_lora_model(
-            lora_config,
-            &vb_lora,
-            Some(linear_config),
-            None,
-            None,
-            None
-        )
-    }
-    Ok(this)
-}
-
-fn linear(size1: usize,
-          size2: usize,
-          vb: VarBuilder,
-) -> Result<LlamaLinear> {
-    let span = tracing::span!(tracing::Level::TRACE, "linear");
-    let inner = candle_nn::linear_no_bias(size1, size2, vb)?;
-    let mut this = LlamaLinear {
-        inner: Arc::new(inner),
-        span,
-    };
-    Ok(this)
-}
-
-fn embedding(cfg: &Config, vb: VarBuilder) -> Result<Embedding> {
-    let embeddings = vb.get((cfg.vocab_size, cfg.hidden_size), "weight")?;
-    Ok(Embedding::new(embeddings, cfg.hidden_size))
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct LayerNormConfig {
-    pub eps: f64,
-    /// Whether to remove the mean or not, the default is true and when set to false, this turns
-    /// this layer into RmsNorm.
-    pub remove_mean: bool,
-    pub affine: bool,
-}
-
-pub fn layer_norm<C: Into<LayerNormConfig>>(
-    size: usize,
-    config: C,
-    vb: VarBuilder,
-) -> Result<LayerNorm> {
-    let config = config.into();
-    let weight = vb.get_with_hints(size, "weight", candle_nn::Init::Const(1.))?;
-    let bias = if config.affine {
-        Some(vb.get_with_hints(size, "bias", candle_nn::Init::Const(0.))?)
-    } else {
-        None
-    };
-    Ok(LayerNorm {
-        weight,
-        bias,
-        remove_mean: config.remove_mean,
-        eps: config.eps,
-    })
-}
-
-// This layer norm version handles both weight and bias so removes the mean.
-#[derive(Clone, Debug)]
-pub struct LayerNorm {
+struct RmsNorm {
     weight: Tensor,
-    bias: Option<Tensor>,
-    remove_mean: bool,
     eps: f64,
+    span: tracing::Span,
 }
 
-impl LayerNorm {
-    pub fn new(weight: Tensor, bias: Tensor, eps: f64) -> Self {
-        Self {
+impl RmsNorm {
+    fn new_from_varbuilder(size: usize, eps: f64, vb: VarBuilder) -> anyhow::Result<Self> {
+        let span = tracing::span!(tracing::Level::TRACE, "rms-norm");
+        let weight = vb.get_with_hints(size, "weight", candle_nn::Init::Const(1.))?;
+
+        Ok(Self {
+            span,
             weight,
-            bias: Some(bias),
-            remove_mean: true,
-            eps,
-        }
+            eps
+        })
     }
 
-    pub fn new_no_bias(weight: Tensor, eps: f64) -> Self {
-        Self {
+    fn new_from_gguf<R: std::io::Seek + std::io::Read>(device: &Device, reader: &mut GGUFReader<R>, prefix: &str) -> anyhow::Result<Self> {
+        let span = tracing::span!(tracing::Level::TRACE, "rms-norm");
+        let rms_norm_eps = reader.get_metadata("llama.attention.layer_norm_rms_epsilon")?.to_f32()? as f64;
+        let weight = reader.get_qtensor(device, prefix, "weight")?;
+        let weight = weight.dequantize(device)?;
+        Ok(Self {
             weight,
-            bias: None,
-            remove_mean: true,
-            eps,
-        }
-    }
-
-    pub fn rms_norm(weight: Tensor, eps: f64) -> Self {
-        Self {
-            weight,
-            bias: None,
-            remove_mean: false,
-            eps,
-        }
-    }
-
-    pub fn weight(&self) -> &Tensor {
-        &self.weight
-    }
-
-    pub fn bias(&self) -> Option<&Tensor> {
-        self.bias.as_ref()
+            eps: rms_norm_eps,
+            span
+        })
     }
 }
 
-impl Module for LayerNorm {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+
+impl Module for RmsNorm {
+    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let x_dtype = x.dtype();
         let internal_dtype = match x_dtype {
             DType::F16 | DType::BF16 => DType::F32,
@@ -332,50 +285,13 @@ impl Module for LayerNorm {
         };
         let hidden_size = x.dim(D::Minus1)?;
         let x = x.to_dtype(internal_dtype)?;
-        let x = if self.remove_mean {
-            let mean_x = (x.sum_keepdim(D::Minus1)? / hidden_size as f64)?;
-            x.broadcast_sub(&mean_x)?
-        } else {
-            x
-        };
         let norm_x = (x.sqr()?.sum_keepdim(D::Minus1)? / hidden_size as f64)?;
         let x_normed = x.broadcast_div(&(norm_x + self.eps)?.sqrt()?)?;
         let x = x_normed.to_dtype(x_dtype)?.broadcast_mul(&self.weight)?;
-        match &self.bias {
-            None => Ok(x),
-            Some(bias) => x.broadcast_add(bias),
-        }
+        Ok(x)
     }
 }
 
-
-#[replace_layer_fields]
-#[derive(AutoLoraConvert)]
-struct RmsNorm {
-    inner: LayerNorm,
-    span: tracing::Span,
-}
-
-impl RmsNorm {
-    fn load(size: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
-        let span = tracing::span!(tracing::Level::TRACE, "rms-norm");
-        let config = LayerNormConfig {
-            eps,
-            remove_mean: false,
-            affine: false,
-        };
-        let inner = layer_norm(size, config, vb)?;
-        Ok(Self { inner, span })
-    }
-
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let _enter = self.span.enter();
-        self.inner.forward(x)
-    }
-}
-
-#[replace_layer_fields]
-#[derive(AutoLoraConvert)]
 struct CausalSelfAttention {
     q_proj: LlamaLinear,
     k_proj: LlamaLinear,
@@ -384,7 +300,6 @@ struct CausalSelfAttention {
     num_attention_heads: usize,
     num_key_value_heads: usize,
     head_dim: usize,
-    use_flash_attn: bool,
     span: tracing::Span,
     span_rot: tracing::Span,
 }
@@ -401,26 +316,37 @@ fn flash_attn(
 }
 
 #[cfg(not(feature = "flash-attn"))]
-fn flash_attn(_: &Tensor, _: &Tensor, _: &Tensor, _: f32, _: bool) -> Result<Tensor> {
+fn flash_attn(_: &Tensor, _: &Tensor, _: &Tensor, _: f32, _: bool) -> anyhow::Result<Tensor> {
     unimplemented!("compile with '--features flash-attn'")
 }
 
 impl CausalSelfAttention {
-    fn apply_rotary_emb(&self, x: &Tensor, index_pos: usize, cache: &Cache) -> Result<Tensor> {
+    fn apply_rotary_emb(&self, x: &Tensor, index_pos: usize, cache: &Cache) -> anyhow::Result<Tensor> {
         let _enter = self.span_rot.enter();
-        let (b_sz, _, seq_len, hidden_size) = x.dims4()?;
+        let (b_sz, n_head, seq_len, hidden_size) = x.dims4()?;
         let cos = cache.cos.narrow(0, index_pos, seq_len)?;
         let sin = cache.sin.narrow(0, index_pos, seq_len)?;
-        let cos = cos.broadcast_as((b_sz, 1, seq_len, hidden_size))?;
-        let sin = sin.broadcast_as((b_sz, 1, seq_len, hidden_size))?;
-        let x1 = x.narrow(D::Minus1, 0, hidden_size / 2)?;
-        let x2 = x.narrow(D::Minus1, hidden_size / 2, hidden_size / 2)?;
-        let rotate_x = Tensor::cat(&[&x2.neg()?, &x1], D::Minus1)?;
-        let rope = (x.broadcast_mul(&cos)? + rotate_x.broadcast_mul(&sin)?)?;
+
+        let cos = cos
+            .narrow(0, 0, seq_len)?
+            .reshape((seq_len, hidden_size / 2, 1))?;
+        let sin = sin
+            .narrow(0, 0, seq_len)?
+            .reshape((seq_len, hidden_size / 2, 1))?;
+
+        let cos = cos.broadcast_as((b_sz, 1, seq_len, hidden_size/2, 1))?;
+        let sin = sin.broadcast_as((b_sz, 1, seq_len, hidden_size/2, 1))?;
+        let x = x.reshape((b_sz, n_head, seq_len, hidden_size / 2, 2))?;
+        let x0 = x.narrow(D::Minus1, 0, 1)?;
+        let x1 = x.narrow(D::Minus1, 1, 1)?;
+        let y0 = (x0.broadcast_mul(&cos)? - x1.broadcast_mul(&sin)?)?;
+        let y1 = (x0.broadcast_mul(&sin)? + x1.broadcast_mul(&cos)?)?;
+        let rope = Tensor::cat(&[y0, y1], D::Minus1)?;
+        let rope = rope.flatten_from(D::Minus2)?;
         Ok(rope)
     }
 
-    fn forward(&self, x: &Tensor, index_pos: usize, block_idx: usize, cache: &Cache, detach_grads: bool) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, index_pos: usize, block_idx: usize, cache: &Cache, detach_grads: bool, use_flash_attn: bool) -> anyhow::Result<Tensor> {
         let _enter = self.span.enter();
         let (b_sz, seq_len, hidden_size) = x.dims3()?;
         let q = self.q_proj.forward(x)?;
@@ -474,7 +400,7 @@ impl CausalSelfAttention {
         let k = self.repeat_kv(k)?;
         let v = self.repeat_kv(v)?;
 
-        let y = if self.use_flash_attn {
+        let y = if use_flash_attn {
             // flash-attn expects (b_sz, seq_len, nheads, head_dim)
             let q = q.transpose(1, 2)?;
             let k = k.transpose(1, 2)?;
@@ -505,6 +431,7 @@ impl CausalSelfAttention {
             // Convert to contiguous as matmul doesn't support strided vs for now.
             att.matmul(&v.contiguous()?)?.to_dtype(in_dtype)?
         };
+
         let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, hidden_size])?;
         let y = self.o_proj.forward(&y)?;
         let y = if detach_grads {
@@ -516,7 +443,7 @@ impl CausalSelfAttention {
         Ok(y)
     }
 
-    fn repeat_kv(&self, x: Tensor) -> Result<Tensor> {
+    fn repeat_kv(&self, x: Tensor) -> anyhow::Result<Tensor> {
         let n_rep = self.num_attention_heads / self.num_key_value_heads;
         if n_rep == 1 {
             Ok(x)
@@ -530,24 +457,20 @@ impl CausalSelfAttention {
         }
     }
 
-    fn load(
+    fn new_from_varbuilder(
         vb: VarBuilder,
         cfg: &Config,
-        merge: bool,
-        lora_config: LoraConfig,
-        linear_config: LoraLinearConfig,
-    ) -> Result<Self> {
+        in_out_dtype: DType
+    ) -> anyhow::Result<Self> {
         let span = tracing::span!(tracing::Level::TRACE, "attn");
         let span_rot = tracing::span!(tracing::Level::TRACE, "attn-rot");
         let size_in = cfg.hidden_size;
         let size_q = (cfg.hidden_size / cfg.num_attention_heads) * cfg.num_attention_heads;
         let size_kv = (cfg.hidden_size / cfg.num_attention_heads) * cfg.num_key_value_heads;
-        let q_proj = linear(size_in, size_q, vb.pp("q_proj"))?;
-        //let k_proj = linear(size_in, size_kv, vb.pp("k_proj"))?;
-        //let v_proj = linear(size_in, size_kv, vb.pp("v_proj"))?;
-        let k_proj = linear_with_lora(size_in, size_kv, vb.pp("k_proj"), vb.pp("lora_k_proj"), merge, lora_config.clone())?;
-        let v_proj = linear_with_lora(size_in, size_kv, vb.pp("v_proj"), vb.pp("lora_v_proj"), merge, lora_config.clone())?;
-        let o_proj = linear(size_q, size_in, vb.pp("o_proj"))?;
+        let q_proj = LlamaLinear::new_from_varbuilder(size_in, size_q, vb.pp("q_proj"), in_out_dtype)?;
+        let k_proj = LlamaLinear::new_from_varbuilder(size_in, size_kv, vb.pp("k_proj"), in_out_dtype)?;
+        let v_proj = LlamaLinear::new_from_varbuilder(size_in, size_kv, vb.pp("v_proj"), in_out_dtype)?;
+        let o_proj = LlamaLinear::new_from_varbuilder(size_q, size_in, vb.pp("o_proj"), in_out_dtype)?;
 
         let mut this = Self {
             q_proj,
@@ -557,11 +480,11 @@ impl CausalSelfAttention {
             num_attention_heads: cfg.num_attention_heads,
             num_key_value_heads: cfg.num_key_value_heads,
             head_dim: cfg.hidden_size / cfg.num_attention_heads,
-            use_flash_attn: cfg.use_flash_attn,
             span,
             span_rot,
         };
 
+        /*
         if merge {
             this.get_merged_lora_model(
                 lora_config,
@@ -581,12 +504,44 @@ impl CausalSelfAttention {
                 None,
             )
         }
-
+*/
         Ok(this)
+    }
+
+    fn new_from_gguf<R: std::io::Seek + std::io::Read>(device: &Device, reader: &mut GGUFReader<R>, prefix: &str, in_out_dtype: DType) -> anyhow::Result<Self> {
+        let span = tracing::span!(tracing::Level::TRACE, "attn");
+        let span_rot = tracing::span!(tracing::Level::TRACE, "attn-rot");
+
+        let q_proj = LlamaLinear::new_from_gguf(device, reader, &format!("{prefix}.attn_q"), in_out_dtype)?;
+        let k_proj = LlamaLinear::new_from_gguf(device, reader, &format!("{prefix}.attn_k"), in_out_dtype)?;
+        let v_proj = LlamaLinear::new_from_gguf(device, reader, &format!("{prefix}.attn_v"), in_out_dtype)?;
+        let o_proj = LlamaLinear::new_from_gguf(device, reader, &format!("{prefix}.attn_output"), in_out_dtype)?;
+
+        let num_attention_heads =  reader.get_metadata("llama.attention.head_count")?.to_u32()? as usize;
+        let num_key_value_heads =  reader.get_metadata("llama.attention.head_count_kv")?.to_u32()? as usize;
+        let embedding_length = reader.get_metadata("llama.embedding_length")?.to_u32()? as usize;
+
+        Ok(Self {
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
+            num_attention_heads,
+            num_key_value_heads,
+            head_dim: embedding_length / num_attention_heads,
+            span,
+            span_rot,
+        })
+    }
+
+    fn add_lora(&mut self, lora_config: &LoraConfig, vb: VarBuilder) -> candle_core::Result<()> {
+        self.k_proj.add_lora(lora_config, vb.pp("attn"))?;
+        self.v_proj.add_lora(lora_config, vb.pp("attn"))?;
+        Ok(())
     }
 }
 
-fn masked_fill(on_false: &Tensor, mask: &Tensor, on_true: f32) -> Result<Tensor> {
+fn masked_fill(on_false: &Tensor, mask: &Tensor, on_true: f32) -> anyhow::Result<Tensor> {
     let shape = mask.shape();
     let on_true = Tensor::new(on_true, on_false.device())?.broadcast_as(shape.dims())?;
     let m = mask.where_cond(&on_true, on_false)?;
@@ -601,19 +556,32 @@ struct Mlp {
 }
 
 impl Mlp {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let _enter = self.span.enter();
         let x = (candle_nn::ops::silu(&self.c_fc1.forward(x)?)? * self.c_fc2.forward(x)?)?;
         self.c_proj.forward(&x)
     }
 
-    fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
+    fn new_from_varbuilder(vb: VarBuilder, cfg: &Config, in_out_dtype: DType) -> anyhow::Result<Self> {
         let span = tracing::span!(tracing::Level::TRACE, "mlp");
         let h_size = cfg.hidden_size;
         let i_size = cfg.intermediate_size;
-        let c_fc1 = linear(h_size, i_size, vb.pp("gate_proj"))?;
-        let c_fc2 = linear(h_size, i_size, vb.pp("up_proj"))?;
-        let c_proj = linear(i_size, h_size, vb.pp("down_proj"))?;
+        let c_fc1 = LlamaLinear::new_from_varbuilder(h_size, i_size, vb.pp("gate_proj"), in_out_dtype)?;
+        let c_proj = LlamaLinear::new_from_varbuilder(i_size, h_size, vb.pp("down_proj"), in_out_dtype)?;
+        let c_fc2 = LlamaLinear::new_from_varbuilder(h_size, i_size, vb.pp("up_proj"), in_out_dtype)?;
+        Ok(Self {
+            c_fc1,
+            c_fc2,
+            c_proj,
+            span,
+        })
+    }
+
+    fn new_from_gguf<R: std::io::Seek + std::io::Read>(device: &Device, reader: &mut GGUFReader<R>, prefix: &str, in_out_dtype: DType) -> anyhow::Result<Self> {
+        let span = tracing::span!(tracing::Level::TRACE, "mlp");
+        let c_fc1 = LlamaLinear::new_from_gguf(device, reader, &format!("{prefix}.ffn_gate"), in_out_dtype)?;
+        let c_fc2 = LlamaLinear::new_from_gguf(device, reader, &format!("{prefix}.ffn_up"), in_out_dtype)?;
+        let c_proj = LlamaLinear::new_from_gguf(device, reader, &format!("{prefix}.ffn_down"), in_out_dtype)?;
         Ok(Self {
             c_fc1,
             c_fc2,
@@ -623,8 +591,6 @@ impl Mlp {
     }
 }
 
-#[replace_layer_fields]
-#[derive(AutoLoraConvert)]
 struct Block {
     rms_1: RmsNorm,
     attn: CausalSelfAttention,
@@ -634,11 +600,13 @@ struct Block {
 }
 
 impl Block {
-    fn forward(&self, x: &Tensor, index_pos: usize, block_idx: usize, cache: &Cache, detach_grads: bool) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, index_pos: usize, block_idx: usize, cache: &Cache, detach_grads: bool, use_flash_attn: bool) -> anyhow::Result<Tensor> {
         let _enter = self.span.enter();
         let residual = x;
         let x = self.rms_1.forward(x)?;
-        let x = (self.attn.forward(&x, index_pos, block_idx, cache, detach_grads)? + residual)?;
+
+        let x = (self.attn.forward(&x, index_pos, block_idx, cache, detach_grads, use_flash_attn)? + residual)?;
+
         let residual = &x;
         let x = (self.mlp.forward(&self.rms_2.forward(&x)?)? + residual)?;
         let x = if detach_grads {
@@ -650,91 +618,165 @@ impl Block {
         Ok(x)
     }
 
-    fn load(
+    fn new_from_varbuilder(
         vb: VarBuilder,
-        cache: &Cache,
         cfg: &Config,
-        merge: bool,
-        lora_config: LoraConfig,
-        linear_config: LoraLinearConfig,
-        embed_onfig: LoraEmbeddingConfig,
-    ) -> Result<Self> {
+        in_out_dtype: DType
+    ) -> anyhow::Result<Self> {
         let span = tracing::span!(tracing::Level::TRACE, "block");
-        let attn = CausalSelfAttention::load(
+        let attn = CausalSelfAttention::new_from_varbuilder(
             vb.pp("self_attn"),
             cfg,
-            merge,
-            lora_config.clone(),
-            linear_config.clone(),
+            in_out_dtype
         )?;
-        let mlp = Mlp::load(vb.pp("mlp"), cfg)?;
-        let rms_1 = RmsNorm::load(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
-        let rms_2 = RmsNorm::load(
+        let mlp = Mlp::new_from_varbuilder(vb.pp("mlp"), cfg, in_out_dtype)?;
+        let rms_1 = RmsNorm::new_from_varbuilder(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
+        let rms_2 = RmsNorm::new_from_varbuilder(
             cfg.hidden_size,
             cfg.rms_norm_eps,
             vb.pp("post_attention_layernorm"),
         )?;
 
-        let mut this = Self {
+        Ok(Self {
             rms_1,
             attn,
             rms_2,
             mlp,
             span,
-        };
+        })
+    }
 
-        if merge {
-            this.get_merged_lora_model(
-                lora_config,
-                &vb.pp("lora_llama_block"),
-                Some(linear_config),
-                None,
-                None,
-                Some(embed_onfig),
-            )
-        } else {
-            this.get_lora_model(
-                lora_config,
-                &vb.pp("lora_llama_block"),
-                Some(linear_config),
-                None,
-                None,
-                Some(embed_onfig),
-            )
-        }
+    fn new_from_gguf<R: std::io::Seek + std::io::Read>(device: &Device, reader: &mut GGUFReader<R>, prefix: &str, in_out_dtype: DType) -> anyhow::Result<Block> {
+        let span = tracing::span!(tracing::Level::TRACE, "block");
+        let rms_1 = RmsNorm::new_from_gguf(device, reader, &format!("{prefix}.attn_norm"))?;
+        let attn = CausalSelfAttention::new_from_gguf(device, reader, prefix, in_out_dtype)?;
+        let rms_2 = RmsNorm::new_from_gguf(device, reader, &format!("{prefix}.ffn_norm"))?;
+        let mlp = Mlp::new_from_gguf(device, reader, prefix, in_out_dtype)?;
 
-        Ok(this)
+        Ok(Self {
+            rms_1,
+            attn,
+            rms_2,
+            mlp,
+            span
+        })
+    }
+
+    fn add_lora(&mut self, lora_config: &LoraConfig, vb: VarBuilder) -> candle_core::Result<()> {
+        self.attn.add_lora(lora_config, vb.pp("attn"))?;
+        Ok(())
     }
 }
 
-#[replace_layer_fields]
-#[derive(AutoLoraConvert)]
 pub struct Llama {
     wte: Embedding,
     blocks: Vec<Block>,
     ln_f: RmsNorm,
-    lm_head: Box<dyn LinearLayerLike>,
+    lm_head: LlamaLinear,
+    hidden_size: usize,
+    num_attention_heads: usize,
+    rope_theta: f32,
+    main_dtype: DType
 }
 
 impl Llama {
-    pub fn forward(&self, x: &Tensor, index_pos: usize, cache: &Cache) -> Result<Tensor> {
+    pub fn new_from_gguf<'a, R: std::io::Seek + std::io::Read>(device: &Device, ct: gguf_file::Content, reader: & mut R, in_out_dtype: DType) -> anyhow::Result<Self>
+    {
+        let mut gguf_reader = GGUFReader::new(ct, reader);
+        gguf_reader.print_metadata();
+
+        let embedding_length = gguf_reader.get_metadata("llama.embedding_length")?.to_u32()? as usize;
+        let block_count = gguf_reader.get_metadata("llama.block_count")?.to_u32()? as usize;
+
+        let tok_embeddings_q = gguf_reader.get_qtensor(device, "token_embd", "weight")?;
+        let tok_embeddings = tok_embeddings_q.dequantize(device)?;
+        let wte = Embedding::new(tok_embeddings, embedding_length);
+
+        let mut blocks = Vec::new();
+        for i in 0..block_count {
+            blocks.push(Block::new_from_gguf(device, &mut gguf_reader, &format!("blk.{i}"), in_out_dtype)?);
+        }
+
+        let ln_f = RmsNorm::new_from_gguf(device, &mut gguf_reader, "output_norm")?;
+
+        let lm_head = LlamaLinear::new_from_gguf(device, &mut gguf_reader, "output", in_out_dtype)?;
+
+        let num_attention_heads =  gguf_reader.get_metadata("llama.attention.head_count")?.to_u32()? as usize;
+
+        let rope_theta = gguf_reader.get_metadata("llama.rope.freq_base")
+            .and_then(|m| m.to_f32().map_err(|e| e.into()))
+            .unwrap_or(10000f32);
+
+        Ok(Self {
+            wte,
+            blocks,
+            ln_f,
+            lm_head,
+            hidden_size: embedding_length,
+            num_attention_heads,
+            rope_theta,
+            main_dtype: in_out_dtype
+        })
+    }
+
+    pub fn new_from_varbuilder(
+        vb: VarBuilder,
+        config: Config,
+        in_out_dtype: DType
+    ) -> anyhow::Result<Self> {
+        let embeddings = vb.pp("model.embed_tokens").get((config.vocab_size, config.hidden_size), "weight")?;
+        let wte = Embedding::new(embeddings, config.hidden_size);
+
+        let lm_head = LlamaLinear::new_from_varbuilder(config.hidden_size, config.vocab_size, vb.pp("lm_head"), in_out_dtype)?;
+        let ln_f = RmsNorm::new_from_varbuilder(config.hidden_size, config.rms_norm_eps, vb.pp("model.norm"))?;
+        let blocks: Vec<_> = (0..config.num_hidden_layers)
+            .map(|i| {
+                Block::new_from_varbuilder(
+                    vb.pp(&format!("model.layers.{i}")),
+                    &config,
+                    in_out_dtype
+                )
+                    .unwrap()
+            })
+            .collect();
+
+        Ok( Self {
+            wte,
+            blocks,
+            ln_f,
+            lm_head,
+            hidden_size: config.hidden_size,
+            num_attention_heads: config.num_attention_heads,
+            rope_theta: config.rope_theta,
+            main_dtype: in_out_dtype
+        })
+    }
+
+    pub fn add_lora(&mut self, lora_config: &LoraConfig, vb: VarBuilder) -> candle_core::Result<()> {
+        for i in 0..self.blocks.len() {
+            self.blocks[i].add_lora(lora_config, vb.pp(format!("block{i}")))?;
+        }
+        Ok(())
+    }
+
+    pub fn forward(&self, x: &Tensor, index_pos: usize, cache: &Cache, use_flash_attn: bool) -> anyhow::Result<Tensor> {
         let (_b_sz, seq_len) = x.dims2()?;
         let mut x = self.wte.forward(x)?;
         for (block_idx, block) in self.blocks.iter().enumerate() {
-            x = block.forward(&x, index_pos, block_idx, cache, true)?;
+            x = block.forward(&x, index_pos, block_idx, cache, true, use_flash_attn)?;
         }
         let x = self.ln_f.forward(&x)?;
         let x = x.i((.., seq_len - 1, ..))?;
         let logits = self.lm_head.forward(&x)?;
-        logits.detach().to_dtype(DType::F32)
+        Ok(logits.detach().to_dtype(DType::F32).map_err(|e| e)?)
     }
 
-    pub fn forward_for_training(&self, x: &Tensor, index_pos: usize, cache: &Cache) -> Result<Tensor> {
-        let (_b_sz, seq_len) = x.dims2()?;
+    pub fn forward_for_training(&self, x: &Tensor, index_pos: usize, cache: &Cache) -> anyhow::Result<Tensor> {
+        let (_b_sz, _seq_len) = x.dims2()?;
         let mut x = self.wte.forward(x)?;
         //println!("after wte: {}", x.backward().unwrap().get_ids().collect::<Vec<_>>().len());
         for (block_idx, block) in self.blocks.iter().enumerate() {
-            x = block.forward(&x, index_pos, block_idx, cache, false)?;
+            x = block.forward(&x, index_pos, block_idx, cache, false, false)?;
             //println!("after block {}: {}", block_idx, x.backward().unwrap().get_ids().collect::<Vec<_>>().len());
         }
         //println!("after blocks: {}", x.backward().unwrap().get_ids().collect::<Vec<_>>().len());
@@ -745,63 +787,39 @@ impl Llama {
         Ok(x)
     }
 
-    /// Load a Mistral model which will be converted to a LoRA model.
-    ///
-    /// The `merge` parameter merges the weights.
-    pub fn load(
-        vb: VarBuilder,
-        cache: &Cache,
-        cfg: &Config,
-        merge: bool,
-        lora_config: LoraConfig,
-        linear_config: LoraLinearConfig,
-        embed_config: LoraEmbeddingConfig,
-    ) -> Result<Self> {
-        let wte = embedding(cfg, vb.pp("model.embed_tokens"))?;
-        let lm_head = linear(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?;
-        let ln_f = RmsNorm::load(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.norm"))?;
-        let blocks: Vec<_> = (0..cfg.num_hidden_layers)
-            .map(|i| {
-                Block::load(
-                    vb.pp(&format!("model.layers.{i}")),
-                    cache,
-                    cfg,
-                    merge,
-                    lora_config.clone(),
-                    linear_config.clone(),
-                    embed_config.clone(),
-                )
-                    .unwrap()
-            })
+    pub fn new_cache(&self, device: &Device, use_kv_cache: bool) -> anyhow::Result<Cache> {
+
+        // precompute freqs_cis
+        let n_elem = self.hidden_size / self.num_attention_heads;
+        //println!("n_elem: {}", n_elem);
+        let theta: Vec<_> = (0..n_elem)
+            .step_by(2)
+            .map(|i| 1f32 / self.rope_theta.powf(i as f32 / n_elem as f32))
             .collect();
+        let theta = Tensor::new(theta.as_slice(), device)?;
+        let idx_theta = Tensor::arange(0, MAX_SEQ_LEN as u32, device)?
+            .to_dtype(DType::F32)?
+            .reshape((MAX_SEQ_LEN, 1))?
+            .matmul(&theta.reshape((1, theta.elem_count()))?)?;
+        // This is different from the paper, see:
+        // https://github.com/huggingface/transformers/blob/6112b1c6442aaf7affd2b0676a1cd4eee30c45cf/src/transformers/models/llama/modeling_llama.py#L112
+        //let idx_theta = Tensor::cat(&[&idx_theta, &idx_theta], D::Minus1)?;
 
-        let mut this = Self {
-            wte: Arc::new(wte),
-            blocks,
-            ln_f,
-            lm_head: Box::new(lm_head),
-        };
+        let cos = idx_theta.cos()?.to_dtype(self.main_dtype)?;
+        let sin = idx_theta.sin()?.to_dtype(self.main_dtype)?;
 
-        if merge {
-            this.get_merged_lora_model(
-                lora_config,
-                &vb.pp("lora_llama"),
-                Some(linear_config),
-                None,
-                None,
-                Some(embed_config),
-            )
-        } else {
-            this.get_lora_model(
-                lora_config,
-                &vb.pp("lora_llama"),
-                Some(linear_config),
-                None,
-                None,
-                Some(embed_config),
-            )
-        }
+        //dump_tensor(&cos);
+        //panic!();
 
-        Ok(this)
+        let num_hidden_layers = self.blocks.len();
+        Ok(Cache {
+            masks: Arc::new(Mutex::new(HashMap::new())),
+            use_kv_cache,
+            kvs: Arc::new(Mutex::new(vec![None; num_hidden_layers])),
+            device: device.clone(),
+            cos,
+            sin,
+            num_hidden_layers
+        })
     }
 }
