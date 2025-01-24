@@ -1,24 +1,26 @@
-use std::net::{Ipv6Addr, SocketAddr};
+use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 use bytes::Bytes;
 use futures::channel::oneshot;
 use crate::speech_to_text::SpeechToText;
 use mumble_protocol_2x::crypt::ClientCryptState;
 use mumble_protocol_2x::voice::{VoicePacket, VoicePacketPayload};
-use std::collections::HashMap;
-use opus::Channels;
-use std::sync::Mutex;
+use std::collections::{HashMap, HashSet};
+use opus::{Application, Channels};
+use std::sync::{Arc, Mutex};
 use std::fs;
-use std::time::{Duration};
+use std::time::{Duration, Instant};
 use futures::{SinkExt, StreamExt};
 use mumble_protocol_2x::control::{msgs, ClientControlCodec, ControlPacket};
 use regex::Regex;
+use socket2::{Domain, SockAddr, Socket, Type};
 use tokio::net::TcpStream;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
-use tokio::time::{sleep, sleep_until, Instant};
+use tokio::time::{sleep, sleep_until};
 use tokio_native_tls::{native_tls, TlsConnector};
 use tokio_util::codec::Decoder;
 use tokio_util::udp::UdpFramed;
+use crate::text_to_speech::TextToSpeech;
 
 pub(crate) async fn connect(
     server_addr: SocketAddr,
@@ -30,7 +32,7 @@ pub(crate) async fn connect(
     new_rx_messages_tx: mpsc::Sender<(u32, String)>,
     mut new_tx_messages_rx: mpsc::Receiver<String>,
     mut must_resync_crypt_rx: mpsc::Receiver<()>,
-    user_map: &Mutex<HashMap<u32, String>>,
+    user_map: Arc<Mutex<HashMap<u32, String>>>,
 ) {
 
     let file_contents = fs::read("mumble_certs/mavis.p12").unwrap();
@@ -82,6 +84,8 @@ pub(crate) async fn connect(
     let mut stored_client_nonce = None;
     let mut stored_server_nonce = None;
 
+
+
     // Handle incoming packets
     loop {
         tokio::select! {
@@ -123,6 +127,12 @@ pub(crate) async fn connect(
                     ControlPacket::ServerSync(sync_data) => {
                         current_session_id = sync_data.session();
                         println!("Logged in!");
+                        let mut inner_user_state = msgs::UserState::new();
+                        inner_user_state.set_channel_id(0);
+                        inner_user_state.set_session(current_session_id);
+                        inner_user_state.set_actor(current_session_id);
+                        sink.send(ControlPacket::UserState(Box::new(inner_user_state))).await.unwrap();
+                        sink.flush().await.unwrap();
                     }
                     ControlPacket::ChannelState(state) => {
                         println!("ChannelState received");
@@ -164,8 +174,8 @@ pub(crate) async fn connect(
                     _ => {}
                 }
             }
-            _ = sleep(Duration::from_secs(1)) => {
-                let mut ping = msgs::Ping::new();
+            _ = sleep(Duration::from_secs(3)) => {
+                let ping = msgs::Ping::new();
                 sink.send(ControlPacket::Ping(Box::new(ping))).await.unwrap();
             }
             Some(text) = new_tx_messages_rx.recv() => {
@@ -176,7 +186,7 @@ pub(crate) async fn connect(
                 sink.flush().await.unwrap();
             }
             _ = must_resync_crypt_rx.recv() => {
-                let mut crypt_setup = msgs::CryptSetup::new();
+                let crypt_setup = msgs::CryptSetup::new();
                 println!("Requesting new crypt state!");
                 sink.send(ControlPacket::CryptSetup(Box::new(crypt_setup))).await.unwrap();
                 sink.flush().await.unwrap();
@@ -184,23 +194,24 @@ pub(crate) async fn connect(
             }
         }
     }
-
-    eprintln!("Client disconnected!!!!!");
 }
 
 pub(crate) async fn handle_udp(
     server_addr: SocketAddr,
     mut crypt_state_recv: mpsc::Receiver<ClientCryptState>,
-    mut speech_to_text: SpeechToText,
-    mut new_stt_tx: mpsc::Sender<(u32, String)>,
-    mut must_resync_crypt_tx: mpsc::Sender<()>,
+    mut incoming_opus_tx: mpsc::Sender<(u32, Vec<u8>, bool)>,
+    mut outgoing_opus_rx: mpsc::Receiver<(Vec<u8>, bool)>,
+    must_resync_crypt_tx: mpsc::Sender<()>,
 ) {
-    let re = Regex::new(r"<[^>]*>").unwrap();
 
-    // Bind UDP socket
-    let udp_socket = UdpSocket::bind((Ipv6Addr::from(0u128), 0u16))
-        .await
-        .expect("Failed to bind UDP socket");
+
+    let inner_socket = Socket::new(Domain::ipv6(), Type::dgram(), None).unwrap();
+    let addr = SocketAddrV6::new(Ipv6Addr::from(0u128), 0u16, 0, 0).into();
+    inner_socket.bind(&addr).expect("Failed to bind UDP socket");
+    inner_socket.set_recv_buffer_size(1000000usize).unwrap();
+    inner_socket.set_nonblocking(true).unwrap();
+    let udp_socket = UdpSocket::from_std(inner_socket.into_udp_socket()).unwrap();
+
 
     // Wait for initial CryptState
     let crypt_state = match crypt_state_recv.recv().await {
@@ -228,10 +239,8 @@ pub(crate) async fn handle_udp(
         server_addr,
     )).await.unwrap();
 
-    let mut opus_decoders = HashMap::<u32, opus::Decoder>::new();
-    let mut pcm_buffers = HashMap::<u32, Vec::<f32>>::new();
-
     let mut error_count = 0;
+    let mut seq_num = 0;
 
     let mut last_resync_request_time = Instant::now();
 
@@ -251,7 +260,7 @@ pub(crate) async fn handle_udp(
                         // To be expected, considering this is the internet, just ignore it
                         if last_resync_request_time.elapsed() > Duration::from_secs(15) {
                             println!("Requesting crypt resync...");
-                            must_resync_crypt_tx.send(()).await.unwrap();
+                            must_resync_crypt_tx.try_send(()).ok();
                             last_resync_request_time = Instant::now();
                         }
                         continue
@@ -273,39 +282,7 @@ pub(crate) async fn handle_udp(
                         // Got audio
                         match payload {
                             VoicePacketPayload::Opus(data, end_of_transmission) => {
-
-                                if !opus_decoders.contains_key(&session_id) {
-                                    opus_decoders.insert(session_id, opus::Decoder::new(16000, Channels::Mono).unwrap());
-                                    pcm_buffers.insert(session_id, Vec::new());
-                                }
-
-                                let mut output_buffer_i16 = [0i16; 32000];
-                                let decoded = opus_decoders.get_mut(&session_id).unwrap().decode(
-                                    data.get(..).unwrap(),
-                                    &mut output_buffer_i16,
-                                    false
-                                ).unwrap();
-                                let mut output_buffer_f32 = [0.0f32; 32000];
-                                for i in 0..decoded {
-                                    output_buffer_f32[i] = (output_buffer_i16[i] as f32 / 32768.0)*2.0 - 1.0;
-                                }
-                                let pcm_buffer = pcm_buffers.get_mut(&session_id).unwrap();
-                                pcm_buffer.extend(&output_buffer_f32[0..decoded]);
-
-                                if pcm_buffer.len() > 16000*10 || end_of_transmission {
-                                    let mel = speech_to_text.pcm_to_mel(&pcm_buffer).unwrap();
-                                    pcm_buffer.clear();
-                                    let res = speech_to_text.run(&mel, None).unwrap();
-                                    speech_to_text.reset_kv_cache();
-                                    for segment in res {
-                                        if segment.dr.no_speech_prob < 0.3 {
-                                            // Strip all special tokens (like <thing>)
-                                            //let text = re.replace_all(segment.dr.text.as_str(), "").into_owned();
-                                            //println!("Before: {}, after: {}", segment.dr.text, text);
-                                            new_stt_tx.send((session_id, segment.dr.text)).await.unwrap();
-                                       }
-                                    }
-                                }
+                                incoming_opus_tx.send((session_id, data.to_vec(), end_of_transmission)).await.unwrap();
                             }
                             _ => {
                                 // Unknown format
@@ -314,11 +291,28 @@ pub(crate) async fn handle_udp(
                     }
                 }
             }
-            _ = sleep_until(next_ping_time) => {
+            Some((data, is_last)) = outgoing_opus_rx.recv() => {
+                let data_bytes = Bytes::copy_from_slice(&data);
+                udp_framed.send((
+                    VoicePacket::Audio {
+                        _dst: std::marker::PhantomData,
+                        target: 0,
+                        session_id: (),
+                        seq_num,
+                        payload: VoicePacketPayload::Opus(data_bytes, is_last),
+                        position_info: None,
+                    },
+                    server_addr,
+                )).await.unwrap();
+                seq_num += 1;
+            }
+            _ = sleep_until(next_ping_time.into()) => {
                 // Send a Ping packet
                 udp_framed.send((VoicePacket::Ping{timestamp: 10}, server_addr)).await.unwrap();
                 next_ping_time = Instant::now() + Duration::from_secs(1);
             }
         }
+
+
     }
 }

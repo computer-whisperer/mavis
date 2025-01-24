@@ -1,12 +1,17 @@
+use std::collections::{HashMap, HashSet};
+use tokio::sync::mpsc;
+use std::time::{Duration, Instant};
 use candle_core::{Device, IndexOp, Tensor};
 use candle_nn::ops::softmax;
 use candle_nn::VarBuilder;
 use candle_transformers::models::mimi::candle;
 use candle_transformers::models::whisper::model::Whisper;
 use candle_transformers::models::whisper;
+use opus::Channels;
 use rand::prelude::Distribution;
 use rand::SeedableRng;
 use tokenizers::Tokenizer;
+use tokio::time::sleep_until;
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -333,5 +338,87 @@ impl SpeechToText {
 
     pub fn reset_kv_cache(&mut self) {
         self.model.reset_kv_cache();
+    }
+
+    pub async fn stt_task(mut self,
+                          mut opus_receiver: mpsc::Receiver<(u32, Vec<u8>, bool)>,
+                          new_stt_tx: mpsc::Sender<(u32, String)>
+    ) {
+        let mut opus_decoders = HashMap::<u32, opus::Decoder>::new();
+        let mut pcm_buffers = HashMap::<u32, Vec::<f32>>::new();
+        let mut audio_packet_timeouts = HashMap::<u32, Option<Instant>>::new();
+
+        loop {
+            let mut next_audio_packet_timeout: Instant = Instant::now() + Duration::from_secs(100);
+            for (key, value) in &audio_packet_timeouts {
+                if let Some(timeout) = value {
+                    next_audio_packet_timeout = if timeout.clone() < next_audio_packet_timeout {
+                        timeout.clone()
+                    }
+                    else {
+                        next_audio_packet_timeout
+                    }
+                }
+            }
+
+            let mut finish_packets = HashSet::new();
+            tokio::select! {
+                Some((session_id, data, end_of_transmission)) = opus_receiver.recv() => {
+                    audio_packet_timeouts.insert(session_id, Some(Instant::now() + Duration::from_secs(1)));
+
+                    if !opus_decoders.contains_key(&session_id) {
+                        opus_decoders.insert(session_id, opus::Decoder::new(16000, Channels::Mono).unwrap());
+                        pcm_buffers.insert(session_id, Vec::new());
+                        let pcm_buffer = pcm_buffers.get_mut(&session_id).unwrap();
+                        pcm_buffer.extend_from_slice(&[0.0; 5000]);
+                    }
+
+                    let mut output_buffer_i16 = [0i16; 32000];
+                    let decoded = opus_decoders.get_mut(&session_id).unwrap().decode(
+                        &data,
+                        &mut output_buffer_i16,
+                        false
+                    ).unwrap();
+                    let mut output_buffer_f32 = [0.0f32; 32000];
+                    for i in 0..decoded {
+                        output_buffer_f32[i] = (output_buffer_i16[i] as f32 / 32768.0)*2.0 - 1.0;
+                    }
+                    let pcm_buffer = pcm_buffers.get_mut(&session_id).unwrap();
+                    pcm_buffer.extend(&output_buffer_f32[0..decoded]);
+
+                    if pcm_buffer.len() > 16000*10 || end_of_transmission {
+                        finish_packets.insert(session_id);
+                    }
+                }
+                _ = sleep_until(next_audio_packet_timeout.into()) => {
+                    for (key, value) in &mut audio_packet_timeouts {
+                        if let Some(timeout) = value {
+                            if Instant::now() >= timeout.clone() {
+                                finish_packets.insert(*key);
+                                *value = None;
+                            }
+                        }
+                    }
+                }
+            }
+
+            for session_id in finish_packets {
+                let pcm_buffer = pcm_buffers.get_mut(&session_id).unwrap();
+                let mel = self.pcm_to_mel(&pcm_buffer).unwrap();
+                pcm_buffer.clear();
+                pcm_buffer.extend_from_slice(&[0.0; 5000]);
+                let res = self.run(&mel, None).unwrap();
+                self.reset_kv_cache();
+                for segment in res {
+                    if segment.dr.no_speech_prob < 0.2 {
+                        // Strip all special tokens (like <thing>)
+                        //let text = re.replace_all(segment.dr.text.as_str(), "").into_owned();
+                        //println!("STT: {}", segment.dr.text);
+                        new_stt_tx.send((session_id, segment.dr.text)).await.unwrap();
+                    }
+                }
+                audio_packet_timeouts.insert(session_id, None);
+            }
+        }
     }
 }

@@ -311,7 +311,7 @@ fn flash_attn(
     v: &Tensor,
     softmax_scale: f32,
     causal: bool,
-) -> Result<Tensor> {
+) -> candle_core::Result<Tensor> {
     candle_flash_attn::flash_attn(q, k, v, softmax_scale, causal)
 }
 
@@ -683,7 +683,7 @@ impl Llama {
     pub fn new_from_gguf<'a, R: std::io::Seek + std::io::Read>(device: &Device, ct: gguf_file::Content, reader: & mut R, in_out_dtype: DType) -> anyhow::Result<Self>
     {
         let mut gguf_reader = GGUFReader::new(ct, reader);
-        gguf_reader.print_metadata();
+        //gguf_reader.print_metadata();
 
         let embedding_length = gguf_reader.get_metadata("llama.embedding_length")?.to_u32()? as usize;
         let block_count = gguf_reader.get_metadata("llama.block_count")?.to_u32()? as usize;

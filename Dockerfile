@@ -22,7 +22,8 @@ RUN apt update && apt install -y \
     libvulkan-dev \
     vulkan-tools \
     libnvidia-gl-565 \
-    protobuf-compiler
+    protobuf-compiler \
+    libcutlass-dev
 RUN rustup default nightly
 
 RUN useradd -rm -d /home/ubuntu -s /bin/bash -g root -G sudo -u 1001 test

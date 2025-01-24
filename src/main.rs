@@ -9,7 +9,7 @@ use mumble_protocol_2x::crypt::ClientCryptState;
 use std::convert::Into;
 use std::convert::TryInto;
 use std::net::ToSocketAddrs;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use candle_core::Device;
 use candle_core::utils::cuda_is_available;
 use tokio::sync::mpsc;
@@ -20,13 +20,28 @@ mod mumble_connector;
 mod chatbot;
 mod hybrid_var_map;
 mod llama;
+mod text_to_speech;
 
 use chatbot::ChatBot;
 use text_generation::TextGeneration;
 use crate::speech_to_text::SpeechToText;
+use crate::text_to_speech::TextToSpeech;
 
+async fn stt_task(device: Device,
+                  mut opus_receiver: mpsc::Receiver<(u32, Vec<u8>, bool)>,
+                  new_stt_tx: mpsc::Sender<(u32, String)>) {
+    let mut speech_to_text = SpeechToText::new(device).unwrap();
+    speech_to_text.stt_task(opus_receiver, new_stt_tx).await
+}
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 10)]
+async fn tts_task(device: Device,
+                  opus_sender: mpsc::Sender<(Vec<u8>, bool)>,
+                  mut new_tts_rx: mpsc::Receiver<String> ) {
+    let mut text_to_speech = TextToSpeech::new(device).unwrap();
+    text_to_speech.tts_task(opus_sender, new_tts_rx).await
+}
+
+#[tokio::main()]
 async fn main() {
     println!(
         "avx: {}, neon: {}, simd128: {}, f16c: {}",
@@ -43,9 +58,10 @@ async fn main() {
     candle_core::cuda::set_gemm_reduced_precision_bf16(true);
 
     // construct a subscriber that prints formatted traces to stdout
-    let subscriber = tracing_subscriber::FmtSubscriber::new();
-    // use that subscriber to process traces emitted after this point
-    tracing::subscriber::set_global_default(subscriber).unwrap();
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_target(false)
+        .init();
 
 
     let (device_a, device_b) = if cuda_is_available() {
@@ -56,6 +72,22 @@ async fn main() {
         (Device::Cpu,
          Device::Cpu)
     };
+
+    let (crypt_state_sender, crypt_state_receiver) = mpsc::channel::<ClientCryptState>(8);
+
+    let (mut new_rx_messages_tx, mut new_rx_messages_rx) = mpsc::channel::<(u32, String)>(32);
+    let (mut new_tx_messages_tx, mut new_tx_messages_rx) = mpsc::channel::<String>(32);
+    let (mut new_stt_tx, mut new_stt_rx) = mpsc::channel::<(u32, String)>(32);
+    let (mut new_tts_tx, mut new_tts_rx) = mpsc::channel::<String>(32);
+    let (mut must_resync_crypt_tx, mut must_resync_crypt_rx) = mpsc::channel::<()>(1);
+    let (mut incoming_opus_tx, mut incoming_opus_rx) = mpsc::channel::<(u32, Vec<u8>, bool)>(32);
+    let (mut outgoing_opus_tx, mut outgoing_opus_rx) = mpsc::channel::<(Vec<u8>, bool)>(32);
+
+    let user_map = Arc::new(Mutex::<HashMap<u32, String>>::new(HashMap::new()));
+
+    tokio::spawn(stt_task(device_b.clone(), incoming_opus_rx, new_stt_tx));
+    tokio::spawn(tts_task(device_b.clone(), outgoing_opus_tx, new_tts_rx));
+
     let mut text_generation = TextGeneration::new(device_a.clone()).unwrap();
 
 
@@ -76,10 +108,6 @@ async fn main() {
 
     let mut chat_bot = ChatBot::new(text_generation);
     chat_bot.load_context();
-
-    //chat_bot.text_generation.clear_context();
-
-    let mut speech_to_text = SpeechToText::new(device_b).unwrap();
 
     // Handle command line arguments
     let mut server_host = "".to_string();
@@ -114,33 +142,27 @@ async fn main() {
 
     // Oneshot channel for setting UDP CryptState from control task
     // For simplicity we don't deal with re-syncing, real applications would have to.
-    let (crypt_state_sender, crypt_state_receiver) = mpsc::channel::<ClientCryptState>(8);
 
-    let (mut new_rx_messages_tx, mut new_rx_messages_rx) = mpsc::channel::<(u32, String)>(32);
-    let (mut new_tx_messages_tx, mut new_tx_messages_rx) = mpsc::channel::<String>(32);
-    let (mut new_stt_tx, mut new_stt_rx) = mpsc::channel::<(u32, String)>(32);
-    let (mut must_resync_crypt_tx, mut must_resync_crypt_rx) = mpsc::channel::<()>(1);
+    tokio::spawn(mumble_connector::connect(
+        server_addr,
+        server_host,
+        user_name,
+        pass_word,
+        accept_invalid_cert,
+        crypt_state_sender,
+        new_rx_messages_tx,
+        new_tx_messages_rx,
+        must_resync_crypt_rx,
+        user_map.clone()
+    ));
 
-    let user_map = Mutex::<HashMap<u32, String>>::new(HashMap::new());
+    tokio::spawn(mumble_connector::handle_udp(
+        server_addr,
+        crypt_state_receiver,
+        incoming_opus_tx,
+        outgoing_opus_rx,
+        must_resync_crypt_tx,
+    ));
 
-    // Run it
-    join!(
-        mumble_connector::connect(
-            server_addr,
-            server_host,
-            user_name,
-            pass_word,
-            accept_invalid_cert,
-            crypt_state_sender,
-            new_rx_messages_tx,
-            new_tx_messages_rx,
-            must_resync_crypt_rx,
-            &user_map
-        ),
-        mumble_connector::handle_udp(
-            server_addr, crypt_state_receiver, speech_to_text, new_stt_tx,
-            must_resync_crypt_tx,
-        ),
-        chat_bot.run(new_rx_messages_rx, new_stt_rx, &user_map, new_tx_messages_tx)
-    );
+    chat_bot.run(new_rx_messages_rx, new_stt_rx, new_tts_tx, user_map.clone(), new_tx_messages_tx).await
 }

@@ -322,7 +322,7 @@ impl TextGeneration {
             is_match = false;
         }
 
-        println!("Looking for \"{}\", generated \"{}\"", filter, generated_text);
+        //println!("Looking for \"{}\", generated \"{}\"", filter, generated_text);
 
         Ok(is_match)
     }
