@@ -27,7 +27,8 @@ pub struct TextGeneration {
     bos_token_id: u32,
     optimizer: AdamW,
     max_inference_context_tokens: usize,
-    max_train_context_tokens: usize
+    max_train_context_tokens: usize,
+    verbose: bool
 }
 
 #[derive(Debug)]
@@ -161,7 +162,8 @@ impl TextGeneration {
             eos_token_id,
             optimizer,
             max_inference_context_tokens: 2048,
-            max_train_context_tokens: 350
+            max_train_context_tokens: 350,
+            verbose: false
         })
     }
 
@@ -387,12 +389,12 @@ impl TextGeneration {
             match self.eos_token_id {
                 LlamaEosToks::Single(eos_tok_id) if next_token == eos_tok_id => {
                     //print!("Got EOS token.");
-                    std::io::stdout().flush()?;
+                    //std::io::stdout().flush()?;
                     break;
                 }
                 LlamaEosToks::Multiple(ref eos_ids) if eos_ids.contains(&next_token) => {
                     //print!("Got EOS token.");
-                    std::io::stdout().flush()?;
+                    //std::io::stdout().flush()?;
                     break;
                 }
                 _ => (),
@@ -407,8 +409,10 @@ impl TextGeneration {
                         self.context_tokens.append(&mut new_tokens);
                         self.context_text.push_str(rest);
                         output.push_str(rest);
-                        print!("{rest}");
-                        std::io::stdout().flush()?;
+                        if self.verbose {
+                            print!("{rest}");
+                            std::io::stdout().flush()?;
+                        }
                         //println!("Got newline (partial token)");
                         break;
                     }
@@ -417,21 +421,27 @@ impl TextGeneration {
                 }
                 output.push_str(&t);
                 self.context_text.push_str(t.as_str());
-                print!("{t}");
-                std::io::stdout().flush()?;
+                if self.verbose {
+                    print!("{t}");
+                    std::io::stdout().flush()?;
+                }
             }
             self.context_tokens.push(next_token);
         }
         let dt = start_gen.elapsed();
         if let Some(rest) = self.tokenizer.decode_rest().map_err(E::msg)? {
             output.push_str(&rest);
-            print!("{rest}");
+            if self.verbose {
+                print!("{rest}");
+                std::io::stdout().flush()?;
+            }
         }
-        std::io::stdout().flush()?;
-        println!(
-            "\n{generated_tokens} tokens generated ({:.2} token/s)",
-            generated_tokens as f64 / dt.as_secs_f64(),
-        );
+        if self.verbose {
+            println!(
+                "\n{generated_tokens} tokens generated ({:.2} token/s)",
+                generated_tokens as f64 / dt.as_secs_f64(),
+            );
+        }
         Ok(output)
     }
 }

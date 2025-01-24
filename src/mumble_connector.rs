@@ -22,6 +22,16 @@ use tokio_util::codec::Decoder;
 use tokio_util::udp::UdpFramed;
 use crate::text_to_speech::TextToSpeech;
 
+
+pub enum MumbleEvent {
+    ServerConnected(),
+    UserConnected(u32),
+    UserPresent(u32),
+    UserDisconnected(u32),
+    EnteredChannel(String),
+    TextMessage((u32, String))
+}
+
 pub(crate) async fn connect(
     server_addr: SocketAddr,
     server_host: String,
@@ -29,7 +39,7 @@ pub(crate) async fn connect(
     pass_word: Option<String>,
     accept_invalid_cert: bool,
     crypt_state_sender: mpsc::Sender<ClientCryptState>,
-    new_rx_messages_tx: mpsc::Sender<(u32, String)>,
+    mumble_event_sender: mpsc::Sender<MumbleEvent>,
     mut new_tx_messages_rx: mpsc::Receiver<String>,
     mut must_resync_crypt_rx: mpsc::Receiver<()>,
     user_map: Arc<Mutex<HashMap<u32, String>>>,
@@ -77,14 +87,18 @@ pub(crate) async fn connect(
     println!("Logging in..");
     let mut crypt_state = None;
 
-    let mut current_channel_id = 0;
-    let mut current_session_id = 0;
+    let mut current_channel_id = None;
+    let mut current_session_id = None;
 
     let mut stored_key = None;
     let mut stored_client_nonce = None;
     let mut stored_server_nonce = None;
 
+    let mut user_channels = HashMap::<u32, u32>::new();
+    let mut current_users_in_channel = HashSet::<u32>::new();
+    let mut channel_names = HashMap::<u32, String>::new();
 
+    mumble_event_sender.send(MumbleEvent::ServerConnected()).await.unwrap();
 
     // Handle incoming packets
     loop {
@@ -98,7 +112,7 @@ pub(crate) async fn connect(
                             println!("Long message received ({} chars), skipping", text.len());
                         }
                         else {
-                            new_rx_messages_tx.send((msg.actor(), text)).await.unwrap();
+                            mumble_event_sender.send(MumbleEvent::TextMessage((msg.actor(), text))).await.unwrap();
                         }
                     }
                     ControlPacket::CryptSetup(msg) => {
@@ -125,24 +139,66 @@ pub(crate) async fn connect(
                                 .expect("Server didn't send us any CryptSetup packet!")).await.unwrap();
                     }
                     ControlPacket::ServerSync(sync_data) => {
-                        current_session_id = sync_data.session();
+                        let session_id = sync_data.session();
+                        current_session_id = Some(session_id);
                         println!("Logged in!");
                         let mut inner_user_state = msgs::UserState::new();
                         inner_user_state.set_channel_id(0);
-                        inner_user_state.set_session(current_session_id);
-                        inner_user_state.set_actor(current_session_id);
+                        inner_user_state.set_session(session_id);
+                        inner_user_state.set_actor(session_id);
                         sink.send(ControlPacket::UserState(Box::new(inner_user_state))).await.unwrap();
                         sink.flush().await.unwrap();
                     }
                     ControlPacket::ChannelState(state) => {
                         println!("ChannelState received");
+                        let channel_id = if state.has_channel_id() {
+                            state.channel_id()
+                        } else {
+                            0
+                        };
+
+                        if state.has_name() {
+                             let channel_name = state.name().to_string();
+                             channel_names.insert(channel_id, channel_name);
+                        }
                     }
                     ControlPacket::UserState(state) => {
                         println!("UserState received");
-                        if state.has_name() {
-                            let user_name = state.name().to_string();
-                            let user_id = state.session();
-                            user_map.lock().unwrap().insert(user_id, user_name);
+                        //println!("{:?}", state);
+
+                        if state.has_session() {
+                            let session_id = state.session();
+                            let channel_id = if state.has_channel_id() {
+                                state.channel_id()
+                            }
+                            else {
+                                0
+                            };
+
+                            if state.has_name() {
+                                let user_name = state.name().to_string();
+                                let user_id = session_id;
+                                user_map.lock().unwrap().insert(user_id, user_name);
+                            }
+                            if let Some(current_channel_id) = current_channel_id {
+                                if let Some(current_session_id) = current_session_id {
+                                    if session_id != current_session_id && channel_id == current_channel_id {
+                                        if user_channels.contains_key(&session_id) {
+                                            if user_channels.get(&session_id).unwrap() != &current_channel_id {
+                                                // User moved in from another channel
+                                                mumble_event_sender.send(MumbleEvent::UserConnected(session_id)).await.unwrap();
+                                                current_users_in_channel.insert(session_id);
+                                            }
+                                        }
+                                        else {
+                                            // New user connection
+                                            mumble_event_sender.send(MumbleEvent::UserConnected(session_id)).await.unwrap();
+                                            current_users_in_channel.insert(session_id);
+                                        }
+                                    }
+                                }
+                            }
+                            user_channels.insert(session_id, channel_id);
                         }
                     }
                     ControlPacket::Reject(msg) => {
@@ -155,7 +211,11 @@ pub(crate) async fn connect(
                         //println!("Received Ping Packet");
                     }
                     ControlPacket::ChannelRemove(_) => {println!("Received Channel Remove Packet");}
-                    ControlPacket::UserRemove(_) => {println!("Received User Remove Packet");}
+                    ControlPacket::UserRemove(msg) => {
+                        if msg.has_session() {
+                            user_channels.remove(&msg.session());
+                        }
+                    }
                     ControlPacket::BanList(_) => {println!("Received BanList Packet");}
                     ControlPacket::PermissionDenied(_) => {println!("Received Permission Denied Packet");}
                     ControlPacket::ACL(_) => {println!("Received ACL Packet");}
@@ -173,17 +233,61 @@ pub(crate) async fn connect(
                     ControlPacket::Other(_) => {println!("Received Other Packet");}
                     _ => {}
                 }
+                if let Some(current_session_id) = current_session_id {
+                    if let Some(new_channel_id) = user_channels.get(&current_session_id) {
+                        let new_channel_name = if let Some(name) = channel_names.get(&new_channel_id) {
+                            name.clone()
+                        }
+                        else {
+                            "Unknown Channel".to_string()
+                        };
+
+                        if let Some(prev_channel_id) = current_channel_id {
+                            if prev_channel_id != *new_channel_id {
+                                mumble_event_sender.send(MumbleEvent::EnteredChannel(new_channel_name)).await.unwrap();
+                            }
+                        }
+                        else {
+                            mumble_event_sender.send(MumbleEvent::EnteredChannel(new_channel_name)).await.unwrap();
+                        }
+                        current_channel_id = Some(*new_channel_id);
+                    }
+
+                    // Update connect/disconnect messages
+                    if let Some(current_channel_id) = current_channel_id {
+                        for (actor, channel) in &user_channels {
+                            if *channel == current_channel_id {
+                                if !current_users_in_channel.contains(actor) {
+                                    if *actor != current_session_id {
+                                        mumble_event_sender.send(MumbleEvent::UserPresent(*actor)).await.unwrap();
+                                    }
+                                    current_users_in_channel.insert(*actor);
+                                }
+                            }
+                        }
+                        for actor in current_users_in_channel.clone() {
+                            if !user_channels.contains_key(&actor) || *user_channels.get(&actor).unwrap() != current_channel_id {
+                                if actor != current_session_id {
+                                    mumble_event_sender.send(MumbleEvent::UserDisconnected(actor)).await.unwrap();
+                                }
+                                current_users_in_channel.remove(&actor);
+                            }
+                        }
+                    }
+                }
             }
             _ = sleep(Duration::from_secs(3)) => {
                 let ping = msgs::Ping::new();
                 sink.send(ControlPacket::Ping(Box::new(ping))).await.unwrap();
             }
             Some(text) = new_tx_messages_rx.recv() => {
-                let mut message = msgs::TextMessage::new();
-                message.set_message(String::from(text));
-                message.set_channel_id(vec!(current_channel_id));
-                sink.send(ControlPacket::TextMessage (Box::new(message))).await.unwrap();
-                sink.flush().await.unwrap();
+                if let Some(current_channel_id) = current_channel_id {
+                    let mut message = msgs::TextMessage::new();
+                    message.set_message(String::from(text));
+                    message.set_channel_id(vec!(current_channel_id));
+                    sink.send(ControlPacket::TextMessage (Box::new(message))).await.unwrap();
+                    sink.flush().await.unwrap();
+                }
             }
             _ = must_resync_crypt_rx.recv() => {
                 let crypt_setup = msgs::CryptSetup::new();
@@ -239,7 +343,6 @@ pub(crate) async fn handle_udp(
         server_addr,
     )).await.unwrap();
 
-    let mut error_count = 0;
     let mut seq_num = 0;
 
     let mut last_resync_request_time = Instant::now();
@@ -253,7 +356,7 @@ pub(crate) async fn handle_udp(
                 last_resync_request_time = Instant::now();
             }
             Some(packet) = udp_framed.next() => {
-                let (packet, src_addr) = match packet {
+                let (packet, _) = match packet {
                     Ok(packet) => packet,
                     Err(err) => {
                         //eprintln!("Got an invalid UDP packet: {:?}", err);

@@ -24,6 +24,7 @@ mod text_to_speech;
 
 use chatbot::ChatBot;
 use text_generation::TextGeneration;
+use crate::mumble_connector::MumbleEvent;
 use crate::speech_to_text::SpeechToText;
 use crate::text_to_speech::TextToSpeech;
 
@@ -75,7 +76,7 @@ async fn main() {
 
     let (crypt_state_sender, crypt_state_receiver) = mpsc::channel::<ClientCryptState>(8);
 
-    let (mut new_rx_messages_tx, mut new_rx_messages_rx) = mpsc::channel::<(u32, String)>(32);
+    let (mut mumble_event_sender, mut mumble_event_receiver) = mpsc::channel::<MumbleEvent>(32);
     let (mut new_tx_messages_tx, mut new_tx_messages_rx) = mpsc::channel::<String>(32);
     let (mut new_stt_tx, mut new_stt_rx) = mpsc::channel::<(u32, String)>(32);
     let (mut new_tts_tx, mut new_tts_rx) = mpsc::channel::<String>(32);
@@ -150,7 +151,7 @@ async fn main() {
         pass_word,
         accept_invalid_cert,
         crypt_state_sender,
-        new_rx_messages_tx,
+        mumble_event_sender,
         new_tx_messages_rx,
         must_resync_crypt_rx,
         user_map.clone()
@@ -164,5 +165,5 @@ async fn main() {
         must_resync_crypt_tx,
     ));
 
-    chat_bot.run(new_rx_messages_rx, new_stt_rx, new_tts_tx, user_map.clone(), new_tx_messages_tx).await
+    chat_bot.run(mumble_event_receiver, new_stt_rx, new_tts_tx, user_map.clone(), new_tx_messages_tx).await
 }
