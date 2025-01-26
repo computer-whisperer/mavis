@@ -1,34 +1,118 @@
 use std::fmt::{Debug, Display, Formatter};
-use anyhow::{Error as E, Result};
-use candle_core::{Device, IndexOp, Tensor};
+use std::sync::Arc;
+use candle_core::{Device, IndexOp, Tensor, Var};
 use candle_core::DType;
 use candle_core::quantized::{gguf_file};
-use candle_examples::token_output_stream::TokenOutputStream;
 use candle_transformers::generation::LogitsProcessor;
-use candle_transformers::models::llama::{LlamaEosToks};
-use crate::llama::{Cache, Llama, LlamaConfig, LoraConfig};
+use crate::llama::{Llama, LlamaConfig, LoraConfig};
+use crate::llama;
 use tokenizers::tokenizer::Tokenizer;
-use candle_nn::{ops, AdamW, Optimizer, VarBuilder};
+use candle_nn::{ops, AdamW, Optimizer, VarBuilder, VarMap};
 use crate::hybrid_var_map::{HybridVarMap, VarOrTensor};
+
+#[derive(Clone)]
+pub struct TextGenerationContext {
+    kv_cache: llama::KVCache,
+    tokens: Vec<u32>,
+    bos_token_id: u32,
+    unprocessed_text: String,
+    tokenizer: Arc<Tokenizer>,
+    last_logits: Option<Tensor>,
+}
+
+impl TextGenerationContext {
+    pub fn add_unprocessed_text(&mut self, text: &str) {
+        self.unprocessed_text.push_str(text);
+        self.last_logits = None;
+    }
+
+    pub fn add_tokens(&mut self, tokens: &[u32]) -> candle_core::Result<()> {
+        if !self.unprocessed_text.is_empty() {
+            self.anneal()?;
+        }
+        self.tokens.extend_from_slice(tokens);
+        self.last_logits = None;
+        Ok(())
+    }
+
+    pub fn tokenize_and_append_unprocessed_text(&mut self) {
+        let tokens = self.tokenizer.encode(self.unprocessed_text.as_str(), false).unwrap().get_ids().to_vec();
+        self.unprocessed_text = String::new();
+        self.tokens.extend_from_slice(&tokens);
+        self.last_logits = None;
+    }
+
+    pub fn anneal(&mut self) -> candle_core::Result<()> {
+        let text = self.to_string();
+        let mut new_tokens = vec![self.bos_token_id];
+        new_tokens.extend(self.tokenizer.encode(text, false).unwrap().get_ids());
+
+        // Figure out how many tokens we can keep
+        let mut tokens_to_keep = 0;
+        let max_tokens_to_keep = self.tokens.len().min(new_tokens.len()).min(self.kv_cache.get_cached_token_count());
+        while tokens_to_keep < max_tokens_to_keep {
+            if new_tokens[tokens_to_keep] != self.tokens[tokens_to_keep] {
+                break;
+            }
+            tokens_to_keep += 1;
+        }
+
+        self.tokens = new_tokens;
+        self.unprocessed_text = String::new();
+        //self.kv_cache.truncate(tokens_to_keep)?;
+        self.kv_cache.reset();
+        self.last_logits = None;
+        Ok(())
+    }
+
+    pub fn get_unprocessed_tokens(&mut self) -> candle_core::Result<&[u32]> {
+        if !self.unprocessed_text.is_empty() {
+            self.anneal()?;
+        }
+        Ok(&self.tokens[self.kv_cache.get_cached_token_count()..])
+    }
+
+    pub fn get_tokens(&mut self) -> candle_core::Result<&[u32]> {
+        if !self.unprocessed_text.is_empty() {
+            self.anneal()?;
+        }
+        Ok(&self.tokens[1..])
+    }
+
+    pub fn to_string(&self) -> String {
+        let mut ret = self.tokenizer.decode(&self.tokens, true).unwrap();
+        ret.push_str(&self.unprocessed_text);
+        ret
+    }
+
+    pub fn get_approximate_num_tokens_in_context(&mut self) -> usize {
+        let unprocessed_token_count = if self.unprocessed_text.is_empty() {
+            0
+        }  else {
+            self.tokenizer.encode(self.unprocessed_text.as_str(), false).unwrap().get_ids().to_vec().len()
+        };
+        self.tokens.len() + unprocessed_token_count
+    }
+
+    pub fn clear_kv_cache(&mut self)  {
+        self.kv_cache.reset()
+    }
+}
 
 pub struct TextGeneration {
     model: Llama,
     device: Device,
-    tokenizer: TokenOutputStream,
-    logits_processor: LogitsProcessor,
-    context_tokens: Vec<u32>,
-    context_text: String,
-    num_context_tokens_processed: usize,
-    cache: Cache,
+    tokenizer: Arc<Tokenizer>,
     use_flash_attn: bool,
     repeat_penalty: f32,
     repeat_last_n: usize,
-    eos_token_id: LlamaEosToks,
+    eos_token_ids: Vec<u32>,
     bos_token_id: u32,
     optimizer: AdamW,
     max_inference_context_tokens: usize,
     max_train_context_tokens: usize,
-    verbose: bool
+    verbose: bool,
+    lora_vm: VarMap
 }
 
 #[derive(Debug)]
@@ -54,7 +138,7 @@ impl std::error::Error for TextGenerationError{
 
 impl TextGeneration {
 
-    pub(crate) fn new(device: Device) -> Result<Self, Box<dyn std::error::Error>> {
+    pub(crate) fn new(device: Device, lora_safetensors_path: Option<std::path::PathBuf>) -> Result<Self, Box<dyn std::error::Error>> {
         let model_path =  "/ceph-fuse/public/neural_models/llms/Meta-Llama-3-8B.Q4_K_M.gguf";
         //let model_path =  "/ceph-fuse/public/neural_models/llms/Meta-Llama-3.1-8B";
         // If it's a dir, it's probably a safetensors import
@@ -78,8 +162,7 @@ impl TextGeneration {
             ];
             let config_filename = model_path.join("config.json");
 
-            let tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(E::msg)?;
-            let tokenizer = TokenOutputStream::new(tokenizer);
+            let tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(anyhow::Error::msg)?;
             let config: LlamaConfig = serde_json::from_slice(&std::fs::read(config_filename)?)?;
             let config = config.into_config();
 
@@ -98,7 +181,7 @@ impl TextGeneration {
             }
             let vb = VarBuilder::from_backend(Box::new(var_map.clone()), dtype, device.clone());
 
-            let model = Llama::new_from_varbuilder(vb, config, dtype)?;
+            let model = Llama::new_from_varbuilder(device.clone(), vb, config, dtype)?;
 
             (model, tokenizer)
         }
@@ -115,30 +198,40 @@ impl TextGeneration {
             //println!("bos token id: {}", gguf_content.metadata.get("tokenizer.ggml.bos_token_id").unwrap().to_u32().unwrap());
             //println!("rope dimension count: {}", gguf_content.metadata.get("llama.rope.dimension_count").unwrap().to_u32().unwrap());
 
-            let model = Llama::new_from_gguf(&device, gguf_content, &mut file, DType::F32)?;
+            let model = Llama::new_from_gguf(device.clone(), gguf_content, &mut file, DType::F32)?;
 
             // temp
             let tokenizer_filename = model_path.join("/ceph-fuse/public/neural_models/llms/Meta-Llama-3.1-8B/tokenizer.json");
-            let tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(E::msg)?;
-            let tokenizer = TokenOutputStream::new(tokenizer);
+            let tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(anyhow::Error::msg)?;
 
             (model, tokenizer)
         };
 
         let r = 256;
         let lora_config = LoraConfig::new(r, (r as f64)*2.0);
-        let mut lora_var_map = HybridVarMap::new();
-        let vb = VarBuilder::from_backend(Box::new(lora_var_map.clone()), dtype, device.clone());
-        model.add_lora(&lora_config, vb)?;
 
-        let cache = model.new_cache(&device, true)?;
 
-        let logits_processor = LogitsProcessor::new(299792458, Some(1.0), None);
+        let mut lora_var_map = VarMap::new();
+
+        if let Some(path) = &lora_safetensors_path {
+            let mut ws = lora_var_map.data().lock().unwrap();
+
+            let tensors = unsafe { candle_core::safetensors::MmapedSafetensors::new(path)? };
+            for (name, _) in tensors.tensors() {
+                let tensor = tensors
+                    .load(&name, &device)?
+                    .to_device(&device)?
+                    .to_dtype(DType::F32)?;
+                ws.insert(name.clone(), Var::from_tensor(&tensor)?);
+            }
+        }
+
+        let lora_vb = VarBuilder::from_backend(Box::new(lora_var_map.clone()), DType::F32, device.clone());
+        model.add_lora(&lora_config, lora_vb)?;
+
         //let bos_token_id = config.bos_token_id.unwrap();
         let bos_token_id = 128000;
-        let mut eos_vec = vec![128001];
-        eos_vec.extend(tokenizer.get_token("\n"));
-        let eos_token_id = LlamaEosToks::Multiple(eos_vec);
+        let eos_token_ids = vec![128001, 198];
 
         let adamw_params = candle_nn::ParamsAdamW {
             lr: 0.00001,
@@ -149,74 +242,74 @@ impl TextGeneration {
         Ok(Self {
             model,
             device,
-            cache,
             use_flash_attn: false,
-            context_tokens: vec![bos_token_id],
-            context_text: String::new(),
-            num_context_tokens_processed: 0,
-            tokenizer,
-            logits_processor,
+            tokenizer: Arc::new(tokenizer),
             repeat_penalty: 1.0,
             repeat_last_n: 10,
             bos_token_id,
-            eos_token_id,
+            eos_token_ids,
             optimizer,
             max_inference_context_tokens: 2048,
             max_train_context_tokens: 350,
-            verbose: false
+            verbose: false,
+            lora_vm: lora_var_map
         })
     }
 
-    pub fn train(&mut self, context: &str, learning_rate: f64) -> Result<()> {
-        self.tokenizer.clear();
-        self.cache.reset();
-        self.optimizer.set_learning_rate(learning_rate);
-        let mut input_tokens = vec![self.bos_token_id];
-        input_tokens.extend(self.tokenizer.tokenizer().encode(context, true).unwrap().get_ids().to_vec());
-        if input_tokens.len() > self.max_train_context_tokens {
-            input_tokens.truncate(self.max_train_context_tokens)
+    pub fn save_lora<P: AsRef<std::path::Path>>(&self, lora_safetensors_path: P) -> candle_core::Result<()> {
+        self.lora_vm.save(lora_safetensors_path)
+    }
+
+    pub fn new_context(&self) -> candle_core::Result<TextGenerationContext> {
+        let kv_cache = self.model.new_kv_cache()?;
+
+        Ok(TextGenerationContext {
+            kv_cache,
+            tokenizer: self.tokenizer.clone(),
+            bos_token_id: self.bos_token_id,
+            tokens: vec![self.bos_token_id],
+            unprocessed_text: String::new(),
+            last_logits: None
+        })
+    }
+
+    pub fn train_text(&mut self, context: Option<&mut TextGenerationContext>, trained_text: &str, learning_rate: f64) -> anyhow::Result<()> {
+        let mut trained_tokens = if let Some(_) = &context {
+            Vec::new()
         }
-        let input_tensor = Tensor::new(input_tokens, &self.device)?.unsqueeze(0)?;
-        //println!("input tensor shape: {:?}", input_tensor.shape());
+        else {
+            vec![self.bos_token_id]
+        };
+        trained_tokens.extend(self.tokenizer.encode(trained_text, true).unwrap().get_ids().to_vec());
+        self.train_tokens(context, &trained_tokens, learning_rate)
+    }
+
+    pub fn train_tokens(&mut self, context: Option<&mut TextGenerationContext>, training_tokens: &[u32], learning_rate: f64) -> anyhow::Result<()> {
+        let context = if let Some(context) = context {
+            self.process_context(context)?;
+            Some(context)
+        } else {
+            None
+        };
+        self.optimizer.set_learning_rate(learning_rate);
+
+        let input_tensor = Tensor::new(training_tokens, &self.device)?.unsqueeze(0)?;
         let context_tensor = input_tensor.i((.., ..input_tensor.dim(1)?-1))?;
-        //println!("context tensor shape: {:?}", context_tensor.shape());
-        let logits = self.model.forward_for_training(&context_tensor, 0, &self.cache)?.squeeze(0)?;
-        self.cache.reset();
-        //println!("output logits shape: {:?}", logits.shape());
+        let cache = if let Some(context) = context {
+            Some(&mut context.kv_cache)
+        } else {
+            None
+        };
+        let logits = self.model.forward(&context_tensor, cache, false, false, false)?.squeeze(0)?;
         let log_sm = ops::log_softmax(&logits, 1)?;
-        //println!("output log_sm shape: {:?}", log_sm.shape());
         let training_values = input_tensor.squeeze(0)?.i((1..))?;
-        //println!("training values shape: {:?}", log_sm.shape());
         let loss = candle_nn::loss::cross_entropy(&log_sm, &training_values)?;
         self.optimizer.backward_step(&loss)?;
         let local_loss = loss.to_dtype(DType::F32)?.to_vec0::<f32>()?;
         println!("Training loss: {}", local_loss);
-        self.cache.reset();
-        self.num_context_tokens_processed = 0;
         Ok(())
     }
 
-    pub fn add_context(&mut self, context: &str) -> Result<()> {
-        use std::io::Write;
-        use anyhow::Error as E;
-        self.tokenizer.clear();
-        self.context_text.push_str(context);
-        let mut new_tokens = self.tokenizer.tokenizer().encode(context, true).unwrap().get_ids().to_vec();
-        self.context_tokens.append(&mut new_tokens);
-        Ok(())
-    }
-
-    pub fn clear_context(&mut self) {
-        self.context_tokens.clear();
-        self.context_tokens.push(self.bos_token_id);
-        self.context_text.clear();
-        self.num_context_tokens_processed = 0;
-        self.cache.reset();
-    }
-
-    pub fn get_context_len(&self) -> usize {
-        self.context_tokens.len()
-    }
 
     pub(crate) fn get_max_train_context_tokens(&self) -> usize {
         self.max_train_context_tokens
@@ -226,216 +319,108 @@ impl TextGeneration {
         self.max_inference_context_tokens
     }
 
-    pub fn get_context_string(&self) -> String {
-        self.context_text.clone()
+    pub fn query_next_generation_logit(&self, context: &mut TextGenerationContext, test: &str) -> anyhow::Result<f32> {
+        self.process_context(context)?;
+
+        let filter_tokens = self.tokenizer.encode(test, true).unwrap().get_ids().to_vec();
+        let input_tokens = Tensor::new(filter_tokens, &self.device)?;
+
+        let logits = self.model.forward(&input_tokens.unsqueeze(0)?, Some(&mut context.kv_cache), false, false, false)?.squeeze(0)?;
+        let last_new_logit = logits.i((logits.dim(0)?-1))?;
+        let first_new_logits = logits.i((0..input_tokens.dim(0)?-1))?;
+
+        let (output_logits, desired_tokens) = if let Some(last_logits) = &context.last_logits {
+            let last_logits = last_logits.unsqueeze(0)?;
+            let logits = Tensor::cat(&[&last_logits, &first_new_logits], 0)?;
+            (logits, input_tokens)
+        } else {
+            let training_values = input_tokens.i((1..))?;
+            (first_new_logits, training_values)
+        };
+        //println!("output tokens: {:?}, desired tokens: {:?}", output_logits.shape(), desired_tokens.shape());
+
+        let log_sm = ops::log_softmax(&output_logits, 1)?;
+        let loss = candle_nn::loss::cross_entropy(&log_sm, &desired_tokens)?;
+        let loss = loss.to_dtype(DType::F32)?.to_vec0::<f32>()?;
+
+        context.last_logits = Some(last_new_logit);
+        Ok(loss)
     }
 
-    pub fn test_next_generation(&mut self, filter: &str) -> Result<bool> {
+    pub fn process_context(&self, context: &mut TextGenerationContext) -> candle_core::Result<()> {
+        let unprocessed_tokens = context.get_unprocessed_tokens()?;
+        if unprocessed_tokens.is_empty() {
+            return Ok(());
+        }
+        let input = Tensor::new(unprocessed_tokens, &self.device)?.unsqueeze(0)?;
+        let logits = self.model.forward(&input, Some(&mut context.kv_cache), self.use_flash_attn, true, true)?.squeeze(0)?;
+        context.last_logits = Some(logits);
+        Ok(())
+    }
+
+    pub(crate) fn run(&self, context: &mut TextGenerationContext, logits_processor: &mut LogitsProcessor) -> anyhow::Result<String> {
+
         use std::io::Write;
-        use anyhow::Error as E;
-        self.tokenizer.clear();
-        let mut local_context_tokens = self.context_tokens.clone();
 
-        self.cache.reset();
-        self.num_context_tokens_processed = 0;
-
-        if self.context_tokens.len() > self.max_inference_context_tokens {
+        if context.tokens.len() > self.max_inference_context_tokens {
             return Err(TextGenerationError::ContextTooLong.into());
         }
 
-        let mut local_tokens_processed = 0usize;
-
-        let mut generated_text = String::new();
+        let mut generated_tokens = 0usize;
+        {
+            let unprocessed_tokens = context.get_unprocessed_tokens()?;
+            println!("{} unprocessed tokens", unprocessed_tokens.len());
+        }
 
         let sample_len = 100;
         let mut output = String::new();
         let start_gen = std::time::Instant::now();
-        for index in 0..sample_len {
-            let logits = {
-                if self.cache.use_kv_cache {
-                    let ctxt = &local_context_tokens[local_tokens_processed..];
-                    let input = Tensor::new(ctxt, &self.device)?.unsqueeze(0)?;
-                    let res = self.model.forward(&input, local_tokens_processed, &self.cache, self.use_flash_attn)?;
-                    local_tokens_processed = local_context_tokens.len();
-                    res
-                }
-                else {
-                    let ctxt = &local_context_tokens[..];
-                    let input = Tensor::new(ctxt, &self.device)?.unsqueeze(0)?;
-                    let res = self.model.forward(&input, 0, &self.cache, self.use_flash_attn)?;
-                    res
-                }
-            };
-            //println!("output logits shape: {:?}", logits.shape());
-            let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
+        for _ in 0..sample_len {
+            let input = Tensor::new(context.get_unprocessed_tokens()?, &self.device)?.unsqueeze(0)?;
+            let logits = self.model.forward(&input, Some(&mut context.kv_cache), self.use_flash_attn, true, true)?.squeeze(0)?.squeeze(0)?;
+            context.last_logits = Some(logits.clone());
+
+            let logits = logits.to_dtype(DType::F32)?;
             let logits = if self.repeat_penalty == 1. {
                 logits
             } else {
-                let start_at = local_context_tokens.len().saturating_sub(self.repeat_last_n);
+                let start_at = context.tokens.len().saturating_sub(self.repeat_last_n);
                 candle_transformers::utils::apply_repeat_penalty(
                     &logits,
                     self.repeat_penalty,
-                    &local_context_tokens[start_at..],
+                    &context.tokens[start_at..],
                 )?
             };
 
-            let next_token = self.logits_processor.sample(&logits)?;
-
-            match self.eos_token_id {
-                LlamaEosToks::Single(eos_tok_id) if next_token == eos_tok_id => {
-                    //print!("Got EOS token.");
-                    std::io::stdout().flush()?;
-                    break;
-                }
-                LlamaEosToks::Multiple(ref eos_ids) if eos_ids.contains(&next_token) => {
-                    //print!("Got EOS token.");
-                    std::io::stdout().flush()?;
-                    break;
-                }
-                _ => (),
-            }
-            if let Some(t) = self.tokenizer.next_token(next_token)? {
-                generated_text.push_str(t.as_str());
-
-                if generated_text.len() > filter.len() {
-                    break;
-                }
-
-                //print!("{t}");
-                std::io::stdout().flush()?;
-            }
-            local_context_tokens.push(next_token);
-        }
-
-        self.cache.reset();
-        self.num_context_tokens_processed = 0;
-
-        let mut is_match = true;
-
-        if generated_text.len() > filter.len() {
-            for i in 0..filter.len() {
-                if generated_text.chars().nth(i).unwrap() != filter.chars().nth(i).unwrap() {
-                    is_match = false;
-                    break;
-                }
-            }
-        }
-        else {
-            is_match = false;
-        }
-
-        //println!("Looking for \"{}\", generated \"{}\"", filter, generated_text);
-
-        Ok(is_match)
-    }
-
-    pub(crate) fn run(&mut self, prompt: &str) -> Result<String> {
-        //println!("{}, {}, {}", self.num_context_tokens_processed, self.context_tokens.len(), self.cache.get_cached_token_count());
-
-        use std::io::Write;
-        use anyhow::Error as E;
-        self.tokenizer.clear();
-        self.context_text.push_str(prompt);
-        let mut new_tokens = self.tokenizer.tokenizer().encode(prompt, true).unwrap().get_ids().to_vec();
-        self.context_tokens.append(&mut new_tokens);
-
-        if self.context_tokens.len() > self.max_inference_context_tokens {
-            return Err(TextGenerationError::ContextTooLong.into());
-        }
-
-        if self.num_context_tokens_processed+1 < self.context_tokens.len() {
-            // For now we do this, hopefully we can fix later
-            self.cache.reset();
-            self.num_context_tokens_processed = 0;
-        }
-
-        let mut generated_tokens = 0usize;
-
-        let sample_len = 50;
-        let mut output = String::new();
-        let start_gen = std::time::Instant::now();
-        for index in 0..sample_len {
-            let logits = {
-                if self.cache.use_kv_cache {
-                    let ctxt = &self.context_tokens[self.num_context_tokens_processed..];
-                    let input = Tensor::new(ctxt, &self.device)?.unsqueeze(0)?;
-                    let res = self.model.forward(&input, self.num_context_tokens_processed, &self.cache, self.use_flash_attn)?;
-                    self.num_context_tokens_processed = self.context_tokens.len();
-                    res
-                }
-                else {
-                    let ctxt = &self.context_tokens[..];
-                    let input = Tensor::new(ctxt, &self.device)?.unsqueeze(0)?;
-                    let res = self.model.forward(&input, 0, &self.cache, self.use_flash_attn)?;
-                    res
-                }
-            };
-            //println!("output logits shape: {:?}", logits.shape());
-            let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
-            let logits = if self.repeat_penalty == 1. {
-                logits
-            } else {
-                let start_at = self.context_tokens.len().saturating_sub(self.repeat_last_n);
-                candle_transformers::utils::apply_repeat_penalty(
-                    &logits,
-                    self.repeat_penalty,
-                    &self.context_tokens[start_at..],
-                )?
-            };
-
-            let next_token = self.logits_processor.sample(&logits)?;
+            let next_token = logits_processor.sample(&logits)?;
 
             generated_tokens += 1;
-            match self.eos_token_id {
-                LlamaEosToks::Single(eos_tok_id) if next_token == eos_tok_id => {
-                    //print!("Got EOS token.");
-                    //std::io::stdout().flush()?;
-                    break;
-                }
-                LlamaEosToks::Multiple(ref eos_ids) if eos_ids.contains(&next_token) => {
-                    //print!("Got EOS token.");
-                    //std::io::stdout().flush()?;
-                    break;
-                }
-                _ => (),
+            if self.eos_token_ids.contains(&next_token) {
+                break;
             }
-            if let Some(t) = self.tokenizer.next_token(next_token)? {
-                if t.contains("\n") {
-                    // End token
-                    if !t.starts_with('\n') {
-                        // Must retain first part
-                        let rest = t.split('\n').next().unwrap();
-                        let mut new_tokens = self.tokenizer.tokenizer().encode(rest, true).unwrap().get_ids().to_vec();
-                        self.context_tokens.append(&mut new_tokens);
-                        self.context_text.push_str(rest);
-                        output.push_str(rest);
-                        if self.verbose {
-                            print!("{rest}");
-                            std::io::stdout().flush()?;
-                        }
-                        //println!("Got newline (partial token)");
-                        break;
+            let token_as_text = self.tokenizer.decode(&[next_token], false).unwrap();
+            if token_as_text.contains("\n") {
+                // End token
+                if !token_as_text.starts_with('\n') {
+                    // Must retain first part
+                    let rest = token_as_text.split('\n').next().unwrap();
+                    context.add_unprocessed_text(rest);
+                    output.push_str(rest);
+                    if self.verbose {
+                        print!("{rest}");
+                        std::io::stdout().flush()?;
                     }
-                    //println!("Got newline");
-                    break;
                 }
-                output.push_str(&t);
-                self.context_text.push_str(t.as_str());
-                if self.verbose {
-                    print!("{t}");
-                    std::io::stdout().flush()?;
-                }
+                break;
             }
-            self.context_tokens.push(next_token);
-        }
-        let dt = start_gen.elapsed();
-        if let Some(rest) = self.tokenizer.decode_rest().map_err(E::msg)? {
-            output.push_str(&rest);
+            output.push_str(&token_as_text);
             if self.verbose {
-                print!("{rest}");
+                print!("{token_as_text}");
                 std::io::stdout().flush()?;
             }
+            context.add_tokens(&[next_token]);
         }
+        let dt = start_gen.elapsed();
         if self.verbose {
             println!(
                 "\n{generated_tokens} tokens generated ({:.2} token/s)",

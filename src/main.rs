@@ -12,6 +12,7 @@ use std::net::ToSocketAddrs;
 use std::sync::{Arc, Mutex};
 use candle_core::Device;
 use candle_core::utils::cuda_is_available;
+use candle_transformers::generation::LogitsProcessor;
 use tokio::sync::mpsc;
 use tokio_util::codec::Decoder;
 mod text_generation;
@@ -29,11 +30,18 @@ use crate::speech_to_text::SpeechToText;
 use crate::text_to_speech::TextToSpeech;
 
 async fn stt_task(device: Device,
-                  mut opus_receiver: mpsc::Receiver<(u32, Vec<u8>, bool)>,
+                  pcm_receiver: mpsc::Receiver<(u32, Vec<f32>)>,
                   new_stt_tx: mpsc::Sender<(u32, String)>) {
     let mut speech_to_text = SpeechToText::new(device).unwrap();
-    speech_to_text.stt_task(opus_receiver, new_stt_tx).await
+    speech_to_text.stt_task(pcm_receiver, new_stt_tx).await
 }
+
+async fn stt_opus_task(
+                  opus_receiver: mpsc::Receiver<(u32, Vec<u8>, bool)>,
+                  pcm_sender: mpsc::Sender<(u32, Vec<f32>)>) {
+    SpeechToText::stt_opus_task(opus_receiver, pcm_sender).await
+}
+
 
 async fn tts_task(device: Device,
                   opus_sender: mpsc::Sender<(Vec<u8>, bool)>,
@@ -42,7 +50,7 @@ async fn tts_task(device: Device,
     text_to_speech.tts_task(opus_sender, new_tts_rx).await
 }
 
-#[tokio::main()]
+#[tokio::main]
 async fn main() {
     println!(
         "avx: {}, neon: {}, simd128: {}, f16c: {}",
@@ -76,38 +84,79 @@ async fn main() {
 
     let (crypt_state_sender, crypt_state_receiver) = mpsc::channel::<ClientCryptState>(8);
 
-    let (mut mumble_event_sender, mut mumble_event_receiver) = mpsc::channel::<MumbleEvent>(32);
-    let (mut new_tx_messages_tx, mut new_tx_messages_rx) = mpsc::channel::<String>(32);
-    let (mut new_stt_tx, mut new_stt_rx) = mpsc::channel::<(u32, String)>(32);
-    let (mut new_tts_tx, mut new_tts_rx) = mpsc::channel::<String>(32);
-    let (mut must_resync_crypt_tx, mut must_resync_crypt_rx) = mpsc::channel::<()>(1);
-    let (mut incoming_opus_tx, mut incoming_opus_rx) = mpsc::channel::<(u32, Vec<u8>, bool)>(32);
-    let (mut outgoing_opus_tx, mut outgoing_opus_rx) = mpsc::channel::<(Vec<u8>, bool)>(32);
+    let (mumble_event_sender, mumble_event_receiver) = mpsc::channel::<MumbleEvent>(32);
+    let (new_tx_messages_tx, new_tx_messages_rx) = mpsc::channel::<String>(32);
+    let (new_stt_tx, new_stt_rx) = mpsc::channel::<(u32, String)>(32);
+    let (new_tts_tx, new_tts_rx) = mpsc::channel::<String>(32);
+    let (must_resync_crypt_tx, must_resync_crypt_rx) = mpsc::channel::<()>(1);
+    let (incoming_opus_tx, incoming_opus_rx) = mpsc::channel::<(u32, Vec<u8>, bool)>(256);
+    let (outgoing_opus_tx, outgoing_opus_rx) = mpsc::channel::<(Vec<u8>, bool)>(32);
+    let (incoming_pcm_tx, incoming_pcm_rx) = mpsc::channel::<(u32, Vec<f32>)>(64);
 
     let user_map = Arc::new(Mutex::<HashMap<u32, String>>::new(HashMap::new()));
 
-    tokio::spawn(stt_task(device_b.clone(), incoming_opus_rx, new_stt_tx));
+    if false {
+        // Text generation testing
+        let mut text_generation = TextGeneration::new(device_a.clone(), None).unwrap();
+        let mut logits_processor = LogitsProcessor::new(299792458, Some(1.0), None);
+
+        let mut context = text_generation.new_context().unwrap();
+        context.add_unprocessed_text("2 + 2 = ");
+        for x in ["0", "1", "2", "3", "4", "5", "6", "fred"] {
+            println!("{}: {}", x, text_generation.query_next_generation_logit(&mut context.clone(), x).unwrap());
+        }
+
+        println!("\n\n\n");
+        let mut logits_processor = LogitsProcessor::new(299792428, Some(1.0), None);
+        let mut context = text_generation.new_context().unwrap();
+        context.add_unprocessed_text("Incrementing integers: 1 2");
+        let out = text_generation.run(&mut context, &mut logits_processor).unwrap();
+        println!("Generated text: {}", out);
+        context.add_unprocessed_text("\nFibonacci sequence: 1 1");
+        let out = text_generation.run(&mut context, &mut logits_processor).unwrap();
+        println!("Generated text: {}", out);
+        context.add_unprocessed_text("\nPi: ");
+        let mut context_b = context.clone();
+        let mut context_c = context.clone();
+
+        let mut logits_processor = LogitsProcessor::new(299792428, Some(1.0), None);
+        let out = text_generation.run(&mut context, &mut logits_processor).unwrap();
+        println!("Generated text a: {}", out);
+
+        context_b.clear_kv_cache();
+        let mut logits_processor = LogitsProcessor::new(299792428, Some(1.0), None);
+        let out = text_generation.run(&mut context_b, &mut logits_processor).unwrap();
+        println!("Generated text b: {}", out);
+
+        let mut logits_processor = LogitsProcessor::new(299792428, Some(1.0), None);
+        let out = text_generation.run(&mut context_c, &mut logits_processor).unwrap();
+        println!("Generated text c: {}", out);
+
+        println!("Full context a: {:?}", context.get_tokens());
+        println!("Full context b: {:?}", context_b.get_tokens());
+        println!("Full context c: {:?}", context_c.get_tokens());
+
+        println!("\n\n\n");
+        let mut logits_processor = LogitsProcessor::new(299792458, Some(1.0), None);
+        for _ in 0..10 {
+            text_generation.train_text(None,"This is a long, mysterious string that I want to burn hard into the llm's memory. What happens now?", 0.0001).unwrap();
+        }
+        let mut context = text_generation.new_context().unwrap();
+        context.add_unprocessed_text("This is a long");
+        println!("Generated text: {}", text_generation.run(&mut context, &mut logits_processor).unwrap());
+
+        context = text_generation.new_context().unwrap();
+        context.add_unprocessed_text("1 2 3 4");
+        println!("Generated text: {}", text_generation.run(&mut context, &mut logits_processor).unwrap());
+        return;
+
+    }
+
+    tokio::spawn(stt_opus_task(incoming_opus_rx, incoming_pcm_tx));
+    tokio::spawn(stt_task(device_b.clone(), incoming_pcm_rx, new_stt_tx));
     tokio::spawn(tts_task(device_b.clone(), outgoing_opus_tx, new_tts_rx));
 
-    let mut text_generation = TextGeneration::new(device_a.clone()).unwrap();
-
-
-    //text_generation.run("fibonacci sequence: 1 1 2 3").unwrap();
-    //text_generation.add_context("This is a long").unwrap();
-    //text_generation.run("This is a different").unwrap();
-    //return;
-/*
-    text_generation.clear_context();
-    for _ in 0..10 {
-        text_generation.train("This is a long, mysterious string that I want to burn hard into the llm's memory. What happens now?", 0.0001).unwrap();
-    }
-    text_generation.run("This is a long");
-    text_generation.clear_context();
-    text_generation.run("This is a different");
-    text_generation.clear_context();
-    return;*/
-
-    let mut chat_bot = ChatBot::new(text_generation);
+    let mut chat_bot = ChatBot::new(device_a);
     chat_bot.load_context();
 
     // Handle command line arguments

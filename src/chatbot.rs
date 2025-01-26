@@ -4,11 +4,14 @@ use std::collections::HashMap;
 use std::fs;
 use std::fs::File;
 use std::io::Write;
+use std::str::FromStr;
 use std::time::Duration;
+use candle_core::Device;
+use candle_transformers::generation::LogitsProcessor;
 use chrono::{DateTime, Utc};
 use tokio::time::sleep;
 use crate::mumble_connector::MumbleEvent;
-use crate::text_generation::TextGeneration;
+use crate::text_generation::{TextGeneration, TextGenerationContext};
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
 struct TextMessageRecord {
@@ -94,7 +97,7 @@ struct ServerConnectedRecord {
 
 impl ServerConnectedRecord {
     fn to_llm_text(&self) -> String {
-        format!("[MAVIS_SYSTEM]: CONNECTED TO SERVER AT {} \n", self.time)
+        format!("[SERVER]: CONNECTED TO SERVER AT {} \n", self.time)
     }
 }
 
@@ -105,7 +108,7 @@ struct ServerDisconnectedRecord {
 
 impl ServerDisconnectedRecord {
     fn to_llm_text(&self) -> String {
-        format!("[MAVIS_SYSTEM]: DISCONNECTED FROM SERVER AT {} \n", self.time)
+        format!("[SERVER]: DISCONNECTED FROM SERVER AT {} \n", self.time)
     }
 }
 
@@ -117,7 +120,7 @@ struct EnteredChannelRecord {
 
 impl EnteredChannelRecord {
     fn to_llm_text(&self) -> String {
-        format!("[MAVIS_SYSTEM]: Entered channel {} \n", self.channel)
+        format!("[SERVER]: Entered channel {} \n", self.channel)
     }
 }
 
@@ -167,46 +170,76 @@ impl Record {
 
 pub(crate) struct ChatBot {
     loaded_context: Vec<Record>,
-    pub(crate) text_generation: TextGeneration,
+    text_generation: TextGeneration,
+    text_generation_context: TextGenerationContext,
     context_log_file: Option<File>,
-    data_directory: String,
+    data_directory: std::path::PathBuf,
     username: String,
     do_tts: bool,
     do_prompt: bool,
+    last_trained_message_datetime: Option<DateTime<Utc>>,
+    training_cycles_since_last_save: usize,
+    prompt_threshold: f32,
+    logits_processor: LogitsProcessor
 }
 
 impl ChatBot {
-    pub fn new(text_generation: TextGeneration) -> Self {
+    pub fn new(device: Device) -> Self {
+        let data_directory = std::path::PathBuf::from_str("/ceph-fuse/public/k8s/mavis/data/").unwrap();
+        // Enumerate files in the lora directory
+        let mut files: Vec<_> = fs::read_dir(data_directory.join("loras")).unwrap().map(|r| r.unwrap()).collect();
+        files.sort_by_key(|dir| dir.path());
+        let (lora_to_use, loaded_datetime) = if let Some(last_file) = files.last() {
+            let last_file_path = last_file.path();
+            let last_file_stem = last_file_path.file_stem().unwrap().to_str().unwrap();
+            let timestamp_str = last_file_stem.split('_').last().unwrap();
+            let timestamp = timestamp_str.parse::<i64>().unwrap();
+            let loaded_datetime: DateTime<Utc> = DateTime::from_timestamp(timestamp, 0).unwrap();
+            (Some(last_file_path), Some(loaded_datetime))
+        } else {
+            (None, None)
+        };
+
+        let mut text_generation = TextGeneration::new(device, lora_to_use).unwrap();
+
+        let text_generation_context = text_generation.new_context().unwrap();
+        let logits_processor = LogitsProcessor::new(299792458, Some(1.0), None);
         Self {
             loaded_context: Vec::new(),
             text_generation,
+            text_generation_context,
             context_log_file: None,
-            data_directory: "/ceph-fuse/public/k8s/mavis/data/".to_string(),
+            data_directory,
             username: "mavis".to_string(),
             do_tts: false,
-            do_prompt: true
+            do_prompt: true,
+            last_trained_message_datetime: loaded_datetime,
+            training_cycles_since_last_save: 0,
+            prompt_threshold: 1.0,
+            logits_processor
         }
     }
 
-    pub fn load_pre_context(&mut self, path: &str) -> anyhow::Result<()> {
-        let text = fs::read_to_string(path)?;
+    pub fn load_pre_context(&mut self) -> anyhow::Result<()> {
+        let text = fs::read_to_string(self.data_directory.join("pre_context_train.txt"))?;
 
         for _ in 0..4 {
             let mut start_offset = 0;
             while start_offset > text.len() {
-                self.text_generation.train(&text.as_str()[start_offset..], 0.0001)?;
+                self.text_generation.train_text(None, &text.as_str()[start_offset..], 0.0001)?;
                 start_offset += 100;
             }
         }
-
-
         Ok(())
     }
 
     pub fn load_context(&mut self) {
-        self.load_pre_context(format!("{}pre_context_train.txt", self.data_directory).as_str()).unwrap();
 
-        let mut files: Vec<_> = fs::read_dir(format!("{}context/", self.data_directory)).unwrap().map(|r| r.unwrap()).collect();
+        if self.last_trained_message_datetime.is_none() {
+            self.load_pre_context().unwrap();
+        }
+
+        let mut files: Vec<_> = fs::read_dir(self.data_directory.join("context")).unwrap().map(|r| r.unwrap()).collect();
         files.sort_by_key(|dir| dir.path());
         for filename in files {
             let f = File::open(filename.path()).unwrap();
@@ -247,7 +280,8 @@ impl ChatBot {
 
     fn export_new_record(&mut self, record: &Record) {
         if self.context_log_file.is_none() {
-            self.context_log_file = Some(File::create(format!("{}context/context_{}.json", self.data_directory, Utc::now().timestamp())).unwrap());
+            let out_path = self.data_directory.join("context").join(format!("context_{}.json", Utc::now().timestamp()));
+            self.context_log_file = Some(File::create(out_path).unwrap());
         }
         let out = serde_json::to_string(record).unwrap();
         if let Some(mut file) = self.context_log_file.as_mut() {
@@ -257,20 +291,59 @@ impl ChatBot {
     }
 
     fn roll_text_generation_context(&mut self) {
-        if self.text_generation.get_context_len() > self.text_generation.get_max_inference_context_tokens()-128 {
-            println!("Training lora!");
-            let context_string = self.text_generation.get_context_string();
-            self.text_generation.train(context_string.as_str(), 0.00002).unwrap();
-            self.text_generation.clear_context();
+        let max_training_tokens = 256;
+        let max_non_training_tokens = 700;
+        let records_advance = 10;
+        let save_every_n_cycles = 10;
+        if self.text_generation_context.get_approximate_num_tokens_in_context() > max_non_training_tokens + max_training_tokens {
+            let last_timestamp = self.loaded_context.last().unwrap().get_time();
+            let do_train = if let Some(last_load_message_date) = self.last_trained_message_datetime {
+                last_timestamp > last_load_message_date
+            } else {
+                true
+            };
 
-            // Delete oldest 1/4 records
-            self.loaded_context.drain(0..10);
+            if false && do_train {
+                // Get tokens out of current context and clear existing context
+                let mut temp_context = self.text_generation.new_context().unwrap();
+                core::mem::swap(&mut temp_context, &mut self.text_generation_context);
+                let context_tokens = temp_context.get_tokens().unwrap();
+
+                // Split context into training and non-training parts
+                let mut training_context = self.text_generation.new_context().unwrap();
+                let split = context_tokens.len()-max_training_tokens;
+                let pre_train_tokens = &context_tokens[..split];
+                let training_tokens = &context_tokens[split..];
+                training_context.add_tokens(pre_train_tokens).unwrap();
+
+                println!("Training lora! {} tokens of context and {} tokens for training", pre_train_tokens.len(), training_tokens.len() );
+                self.text_generation.train_tokens(Some(&mut training_context), training_tokens, 0.00001).unwrap();
+
+                self.last_trained_message_datetime = Some(last_timestamp);
+                self.training_cycles_since_last_save += 1;
+            }
+            else {
+                self.text_generation_context = self.text_generation.new_context().unwrap();
+            }
+
+            if self.training_cycles_since_last_save > save_every_n_cycles {
+                self.save_lora_checkpoint().unwrap();
+            }
+
+            // Delete oldest 10 records
+            self.loaded_context.drain(..records_advance);
 
             // load the model with the remaining context
             for record in &self.loaded_context {
-                self.text_generation.add_context(record.to_llm_text().as_str()).unwrap();
+                self.text_generation_context.add_unprocessed_text(&record.to_llm_text());
             }
         }
+    }
+
+    fn save_lora_checkpoint(&mut self) -> candle_core::Result<()> {
+        let out_path = self.data_directory.join("loras").join(format!("checkpoint_{}.safetensors", self.last_trained_message_datetime.unwrap().timestamp()));
+        self.training_cycles_since_last_save = 0;
+        self.text_generation.save_lora(out_path)
     }
 
     fn process_new_record(&mut self, record: Record, do_export: bool, add_to_llm_context: bool) {
@@ -282,7 +355,7 @@ impl ChatBot {
         if llm_text.len() < 200 {
             self.loaded_context.push(record);
             if add_to_llm_context {
-                self.text_generation.add_context(llm_text.as_str()).unwrap();
+                self.text_generation_context.add_unprocessed_text(&llm_text);
                 self.roll_text_generation_context();
             }
         }
@@ -344,20 +417,18 @@ impl ChatBot {
                                         }
                                     }
                                     if parts[1] == "prompt" {
-                                        if parts.len() == 2 {
-                                            self.do_prompt = !self.do_prompt;
-                                        }
-                                        else {
-                                            if parts[2] == "on" || parts[2] == "yes" {
-                                                self.do_prompt = true;
-                                            }
-                                            else {
-                                                self.do_prompt = false;
-                                            }
-                                        }
+                                        do_prompt_model = true;
+                                        force_model_to_talk = true;
                                     }
                                     if parts[1] == "dump" {
-                                        println!("{}", self.text_generation.get_context_string())
+                                        println!("{}", self.text_generation_context.to_string())
+                                    }
+                                    if parts[1] == "threshold" {
+                                        if parts.len() > 2 {
+                                            if let Ok(threshold) = parts[2].parse::<f32>() {
+                                                self.prompt_threshold = threshold;
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -406,10 +477,23 @@ impl ChatBot {
                     if !mumble_event_receiver.is_empty() || !new_stt_rx.is_empty() {
                         break;
                     }
-                    if (i == 0 && force_model_to_talk) || self.text_generation.test_next_generation("[mavis]:").unwrap() {
-                        let result = self.text_generation.run(format!("[{}]:", self.username).as_str());
+
+                    let do_prompt = if (i == 0 && force_model_to_talk) {
+                        true
+                    }
+                    else {
+                        let score = self.text_generation.query_next_generation_logit(&mut self.text_generation_context.clone(), format!("[{}]:", self.username).as_str()).unwrap();
+                        println!("Mavis reply score: {}", score);
+                        score < self.prompt_threshold
+                    };
+
+                    if do_prompt {
+                        self.text_generation_context.add_unprocessed_text(format!("[{}]: ", self.username).as_str());
+
+                        let result = self.text_generation.run(&mut self.text_generation_context, &mut self.logits_processor);
                         if let Ok(mut text_result) = result {
-                            self.text_generation.add_context("\n").unwrap();
+                            // Newline token
+                            self.text_generation_context.add_unprocessed_text("\n");
 
                             if self.do_tts { // Voice
                                 new_tts_tx.send(text_result.clone()).await.unwrap();
@@ -429,7 +513,6 @@ impl ChatBot {
                         else {
                             println!("Error generating response: {:?}", result);
                         }
-
                     }
                     else {
                         break;

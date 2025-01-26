@@ -202,45 +202,38 @@ impl Module for LlamaLinear {
     }
 }
 
+
 #[derive(Clone)]
-pub struct Cache {
-    masks: Arc<Mutex<HashMap<usize, Tensor>>>,
-    pub use_kv_cache: bool,
+pub struct KVCache {
     #[allow(clippy::type_complexity)]
-    kvs: Arc<Mutex<Vec<Option<(Tensor, Tensor)>>>>,
-    cos: Tensor,
-    sin: Tensor,
-    device: Device,
+    kvs: Vec<Option<(Tensor, Tensor)>>,
+    tokens_processed: usize,
     num_hidden_layers: usize,
 }
 
-impl Cache {
-
-    fn mask(&self, t: usize) -> anyhow::Result<Tensor> {
-        let mut masks = self.masks.lock().unwrap();
-        if let Some(mask) = masks.get(&t) {
-            Ok(mask.clone())
-        } else {
-            let mask: Vec<_> = (0..t)
-                .flat_map(|i| (0..t).map(move |j| u8::from(j > i)))
-                .collect();
-            let mask = Tensor::from_slice(&mask, (t, t), &self.device)?;
-            masks.insert(t, mask.clone());
-            Ok(mask)
-        }
+impl KVCache {
+    pub fn reset(&mut self) {
+        self.kvs = vec![None; self.num_hidden_layers];
+        self.tokens_processed = 0;
     }
 
-    pub fn reset(&mut self) {
-        self.masks = Arc::new(Mutex::new(HashMap::new()));
-        self.kvs = Arc::new(Mutex::new(vec![None; self.num_hidden_layers]));
+    pub fn truncate(&mut self, num_entries: usize) -> candle_core::Result<()> {
+        for kvs in &mut self.kvs {
+            *kvs = match kvs {
+                Some((k, v)) => {
+                    let k = k.i((.., .., ..num_entries))?.detach();
+                    let v = v.i((.., .., ..num_entries))?.detach();
+                    Some((k, v))
+                },
+                None => None,
+            }
+        }
+        self.tokens_processed = num_entries;
+        Ok(())
     }
 
     pub fn get_cached_token_count(&self) -> usize {
-        let w = self.kvs.lock().unwrap();
-        match &w[0] {
-            Some((k, _)) => {k.dims()[2]}
-            None => 0,
-        }
+        self.tokens_processed
     }
 }
 
@@ -316,16 +309,16 @@ fn flash_attn(
 }
 
 #[cfg(not(feature = "flash-attn"))]
-fn flash_attn(_: &Tensor, _: &Tensor, _: &Tensor, _: f32, _: bool) -> anyhow::Result<Tensor> {
+fn flash_attn(_: &Tensor, _: &Tensor, _: &Tensor, _: f32, _: bool) -> candle_core::Result<Tensor> {
     unimplemented!("compile with '--features flash-attn'")
 }
 
 impl CausalSelfAttention {
-    fn apply_rotary_emb(&self, x: &Tensor, index_pos: usize, cache: &Cache) -> anyhow::Result<Tensor> {
+    fn apply_rotary_emb(&self, llama: &Llama, x: &Tensor, index_pos: usize) -> candle_core::Result<Tensor> {
         let _enter = self.span_rot.enter();
         let (b_sz, n_head, seq_len, hidden_size) = x.dims4()?;
-        let cos = cache.cos.narrow(0, index_pos, seq_len)?;
-        let sin = cache.sin.narrow(0, index_pos, seq_len)?;
+        let cos = llama.cos.narrow(0, index_pos, seq_len)?;
+        let sin = llama.sin.narrow(0, index_pos, seq_len)?;
 
         let cos = cos
             .narrow(0, 0, seq_len)?
@@ -346,7 +339,7 @@ impl CausalSelfAttention {
         Ok(rope)
     }
 
-    fn forward(&self, x: &Tensor, index_pos: usize, block_idx: usize, cache: &Cache, detach_grads: bool, use_flash_attn: bool) -> anyhow::Result<Tensor> {
+    fn forward(&self, llama: &Llama, x: &Tensor, block_idx: usize, kv_cache: Option<&mut KVCache>, detach_grads: bool, use_flash_attn: bool) -> candle_core::Result<Tensor> {
         let _enter = self.span.enter();
         let (b_sz, seq_len, hidden_size) = x.dims3()?;
         let q = self.q_proj.forward(x)?;
@@ -363,35 +356,33 @@ impl CausalSelfAttention {
             .reshape((b_sz, seq_len, self.num_key_value_heads, self.head_dim))?
             .transpose(1, 2)?;
 
-        let q = self.apply_rotary_emb(&q, index_pos, cache)?;
-        let mut k = self.apply_rotary_emb(&k, index_pos, cache)?;
+        let index_pos = if let Some(kv_cache) = &kv_cache{
+            kv_cache.tokens_processed
+        } else {
+            0
+        };
+
+        let q = self.apply_rotary_emb(llama, &q, index_pos)?;
+        let mut k = self.apply_rotary_emb(llama, &k, index_pos)?;
+
+        let mut full_seq_len = seq_len;
 
         //println!("k shape (a): {:?}", k.shape());
         //println!("v shape (a): {:?}", v.shape());
 
-        if cache.use_kv_cache {
-            let mut cache = cache.kvs.lock().unwrap();
-            if let Some((cache_k, cache_v)) = &cache[block_idx] {
+        if let Some(kv_cache) = kv_cache {
+            if let Some((cache_k, cache_v)) = &kv_cache.kvs[block_idx] {
+                assert_eq!(cache_k.dim(2)?, kv_cache.tokens_processed);
+                assert_eq!(cache_v.dim(2)?, kv_cache.tokens_processed);
                 k = Tensor::cat(&[cache_k, &k], 2)?.contiguous()?;
                 v = Tensor::cat(&[cache_v, &v], 2)?.contiguous()?;
-                let k_seq_len = k.dims()[1];
-                if k_seq_len > MAX_SEQ_LEN {
-                    k = k
-                        .narrow(D::Minus1, k_seq_len - MAX_SEQ_LEN, MAX_SEQ_LEN)?
-                        .contiguous()?
-                }
-                let v_seq_len = v.dims()[1];
-                if v_seq_len > 2 * MAX_SEQ_LEN {
-                    v = v
-                        .narrow(D::Minus1, v_seq_len - MAX_SEQ_LEN, MAX_SEQ_LEN)?
-                        .contiguous()?
-                }
+                full_seq_len = k.dims()[2];
             }
             if detach_grads {
-                cache[block_idx] = Some((k.detach(), v.detach()))
+                kv_cache.kvs[block_idx] = Some((k.detach(), v.detach()))
             }
             else {
-                cache[block_idx] = Some((k.clone(), v.clone()))
+                kv_cache.kvs[block_idx] = Some((k.clone(), v.clone()))
             }
         }
         //println!("k shape (b): {:?}", k.shape());
@@ -419,10 +410,10 @@ impl CausalSelfAttention {
             //println!("att shape: {:?}", att.shape());
 
 
-            let att = if seq_len == 1 {
+            let att = if seq_len == 1 && false {
                 att
             } else {
-                let mask = cache.mask(seq_len)?;
+                let mask = llama.mask(seq_len, full_seq_len)?;
                 //println!("mask shape: {:?}", mask.shape());
                 let mask = mask.broadcast_as(att.shape())?;
                 masked_fill(&att, &mask, f32::NEG_INFINITY)?
@@ -443,7 +434,7 @@ impl CausalSelfAttention {
         Ok(y)
     }
 
-    fn repeat_kv(&self, x: Tensor) -> anyhow::Result<Tensor> {
+    fn repeat_kv(&self, x: Tensor) -> candle_core::Result<Tensor> {
         let n_rep = self.num_attention_heads / self.num_key_value_heads;
         if n_rep == 1 {
             Ok(x)
@@ -541,7 +532,7 @@ impl CausalSelfAttention {
     }
 }
 
-fn masked_fill(on_false: &Tensor, mask: &Tensor, on_true: f32) -> anyhow::Result<Tensor> {
+fn masked_fill(on_false: &Tensor, mask: &Tensor, on_true: f32) -> candle_core::Result<Tensor> {
     let shape = mask.shape();
     let on_true = Tensor::new(on_true, on_false.device())?.broadcast_as(shape.dims())?;
     let m = mask.where_cond(&on_true, on_false)?;
@@ -600,12 +591,12 @@ struct Block {
 }
 
 impl Block {
-    fn forward(&self, x: &Tensor, index_pos: usize, block_idx: usize, cache: &Cache, detach_grads: bool, use_flash_attn: bool) -> anyhow::Result<Tensor> {
+    fn forward(&self, llama: &Llama, x: &Tensor, block_idx: usize, kv_cache: Option<&mut KVCache>, detach_grads: bool, use_flash_attn: bool) -> candle_core::Result<Tensor> {
         let _enter = self.span.enter();
         let residual = x;
         let x = self.rms_1.forward(x)?;
 
-        let x = (self.attn.forward(&x, index_pos, block_idx, cache, detach_grads, use_flash_attn)? + residual)?;
+        let x = (self.attn.forward(llama, &x, block_idx, kv_cache, detach_grads, use_flash_attn)? + residual)?;
 
         let residual = &x;
         let x = (self.mlp.forward(&self.rms_2.forward(&x)?)? + residual)?;
@@ -676,11 +667,15 @@ pub struct Llama {
     hidden_size: usize,
     num_attention_heads: usize,
     rope_theta: f32,
-    main_dtype: DType
+    main_dtype: DType,
+    masks: Arc<Mutex<HashMap<(usize, usize), Tensor>>>,
+    cos: Tensor,
+    sin: Tensor,
+    device: Device,
 }
 
 impl Llama {
-    pub fn new_from_gguf<'a, R: std::io::Seek + std::io::Read>(device: &Device, ct: gguf_file::Content, reader: & mut R, in_out_dtype: DType) -> anyhow::Result<Self>
+    pub fn new_from_gguf<'a, R: std::io::Seek + std::io::Read>(device: Device, ct: gguf_file::Content, reader: & mut R, in_out_dtype: DType) -> anyhow::Result<Self>
     {
         let mut gguf_reader = GGUFReader::new(ct, reader);
         //gguf_reader.print_metadata();
@@ -688,24 +683,26 @@ impl Llama {
         let embedding_length = gguf_reader.get_metadata("llama.embedding_length")?.to_u32()? as usize;
         let block_count = gguf_reader.get_metadata("llama.block_count")?.to_u32()? as usize;
 
-        let tok_embeddings_q = gguf_reader.get_qtensor(device, "token_embd", "weight")?;
-        let tok_embeddings = tok_embeddings_q.dequantize(device)?;
+        let tok_embeddings_q = gguf_reader.get_qtensor(&device, "token_embd", "weight")?;
+        let tok_embeddings = tok_embeddings_q.dequantize(&device)?;
         let wte = Embedding::new(tok_embeddings, embedding_length);
 
         let mut blocks = Vec::new();
         for i in 0..block_count {
-            blocks.push(Block::new_from_gguf(device, &mut gguf_reader, &format!("blk.{i}"), in_out_dtype)?);
+            blocks.push(Block::new_from_gguf(&device, &mut gguf_reader, &format!("blk.{i}"), in_out_dtype)?);
         }
 
-        let ln_f = RmsNorm::new_from_gguf(device, &mut gguf_reader, "output_norm")?;
+        let ln_f = RmsNorm::new_from_gguf(&device, &mut gguf_reader, "output_norm")?;
 
-        let lm_head = LlamaLinear::new_from_gguf(device, &mut gguf_reader, "output", in_out_dtype)?;
+        let lm_head = LlamaLinear::new_from_gguf(&device, &mut gguf_reader, "output", in_out_dtype)?;
 
         let num_attention_heads =  gguf_reader.get_metadata("llama.attention.head_count")?.to_u32()? as usize;
 
         let rope_theta = gguf_reader.get_metadata("llama.rope.freq_base")
             .and_then(|m| m.to_f32().map_err(|e| e.into()))
             .unwrap_or(10000f32);
+
+        let (sin, cos) = Self::init_positional_embeddings(&device, in_out_dtype, embedding_length, num_attention_heads, rope_theta)?;
 
         Ok(Self {
             wte,
@@ -715,11 +712,16 @@ impl Llama {
             hidden_size: embedding_length,
             num_attention_heads,
             rope_theta,
-            main_dtype: in_out_dtype
+            main_dtype: in_out_dtype,
+            sin,
+            cos,
+            device,
+            masks: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
     pub fn new_from_varbuilder(
+        device: Device,
         vb: VarBuilder,
         config: Config,
         in_out_dtype: DType
@@ -740,7 +742,9 @@ impl Llama {
             })
             .collect();
 
-        Ok( Self {
+        let (sin, cos) = Self::init_positional_embeddings(&device, in_out_dtype, config.hidden_size, config.num_attention_heads, config.rope_theta)?;
+
+        Ok(Self {
             wte,
             blocks,
             ln_f,
@@ -748,53 +752,21 @@ impl Llama {
             hidden_size: config.hidden_size,
             num_attention_heads: config.num_attention_heads,
             rope_theta: config.rope_theta,
-            main_dtype: in_out_dtype
+            main_dtype: in_out_dtype,
+            sin,
+            cos,
+            device,
+            masks: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
-    pub fn add_lora(&mut self, lora_config: &LoraConfig, vb: VarBuilder) -> candle_core::Result<()> {
-        for i in 0..self.blocks.len() {
-            self.blocks[i].add_lora(lora_config, vb.pp(format!("block{i}")))?;
-        }
-        Ok(())
-    }
-
-    pub fn forward(&self, x: &Tensor, index_pos: usize, cache: &Cache, use_flash_attn: bool) -> anyhow::Result<Tensor> {
-        let (_b_sz, seq_len) = x.dims2()?;
-        let mut x = self.wte.forward(x)?;
-        for (block_idx, block) in self.blocks.iter().enumerate() {
-            x = block.forward(&x, index_pos, block_idx, cache, true, use_flash_attn)?;
-        }
-        let x = self.ln_f.forward(&x)?;
-        let x = x.i((.., seq_len - 1, ..))?;
-        let logits = self.lm_head.forward(&x)?;
-        Ok(logits.detach().to_dtype(DType::F32).map_err(|e| e)?)
-    }
-
-    pub fn forward_for_training(&self, x: &Tensor, index_pos: usize, cache: &Cache) -> anyhow::Result<Tensor> {
-        let (_b_sz, _seq_len) = x.dims2()?;
-        let mut x = self.wte.forward(x)?;
-        //println!("after wte: {}", x.backward().unwrap().get_ids().collect::<Vec<_>>().len());
-        for (block_idx, block) in self.blocks.iter().enumerate() {
-            x = block.forward(&x, index_pos, block_idx, cache, false, false)?;
-            //println!("after block {}: {}", block_idx, x.backward().unwrap().get_ids().collect::<Vec<_>>().len());
-        }
-        //println!("after blocks: {}", x.backward().unwrap().get_ids().collect::<Vec<_>>().len());
-        let x = self.ln_f.forward(&x)?;
-        //println!("after ln_f: {}", x.backward().unwrap().get_ids().collect::<Vec<_>>().len());
-        let x = self.lm_head.forward(&x)?;
-        //println!("after lm_head: {}", x.backward().unwrap().get_ids().collect::<Vec<_>>().len());
-        Ok(x)
-    }
-
-    pub fn new_cache(&self, device: &Device, use_kv_cache: bool) -> anyhow::Result<Cache> {
-
+    pub fn init_positional_embeddings(device: &Device, dtype: DType, hidden_size: usize, num_attention_heads: usize, rope_theta: f32) -> candle_core::Result<(Tensor, Tensor)> {
         // precompute freqs_cis
-        let n_elem = self.hidden_size / self.num_attention_heads;
+        let n_elem = hidden_size / num_attention_heads;
         //println!("n_elem: {}", n_elem);
         let theta: Vec<_> = (0..n_elem)
             .step_by(2)
-            .map(|i| 1f32 / self.rope_theta.powf(i as f32 / n_elem as f32))
+            .map(|i| 1f32 / rope_theta.powf(i as f32 / n_elem as f32))
             .collect();
         let theta = Tensor::new(theta.as_slice(), device)?;
         let idx_theta = Tensor::arange(0, MAX_SEQ_LEN as u32, device)?
@@ -805,21 +777,72 @@ impl Llama {
         // https://github.com/huggingface/transformers/blob/6112b1c6442aaf7affd2b0676a1cd4eee30c45cf/src/transformers/models/llama/modeling_llama.py#L112
         //let idx_theta = Tensor::cat(&[&idx_theta, &idx_theta], D::Minus1)?;
 
-        let cos = idx_theta.cos()?.to_dtype(self.main_dtype)?;
-        let sin = idx_theta.sin()?.to_dtype(self.main_dtype)?;
+        let cos = idx_theta.cos()?.to_dtype(dtype)?;
+        let sin = idx_theta.sin()?.to_dtype(dtype)?;
 
-        //dump_tensor(&cos);
-        //panic!();
+        Ok((sin, cos))
+    }
 
+    pub fn add_lora(&mut self, lora_config: &LoraConfig, vb: VarBuilder) -> candle_core::Result<()> {
+        for i in 0..self.blocks.len() {
+            self.blocks[i].add_lora(lora_config, vb.pp(format!("block{i}")))?;
+        }
+        Ok(())
+    }
+
+    pub fn forward(&self, x: &Tensor, kv_cache: Option<&mut KVCache>, use_flash_attn: bool, detach_grads: bool, only_last_output: bool) -> candle_core::Result<Tensor> {
+        let (_b_sz, seq_len) = x.dims2()?;
+        let mut x = self.wte.forward(x)?;
+        if let Some(kv_cache) = kv_cache {
+            for (block_idx, block) in self.blocks.iter().enumerate() {
+                x = block.forward(self, &x, block_idx, Some(kv_cache), detach_grads, use_flash_attn)?;
+            }
+            kv_cache.tokens_processed += seq_len;
+        }
+        else {
+            for (block_idx, block) in self.blocks.iter().enumerate() {
+                x = block.forward(self, &x, block_idx, None, detach_grads, use_flash_attn)?;
+            }
+        }
+        // Release masks for de-alloc
+        self.masks.lock().unwrap().clear();
+
+        let x = self.ln_f.forward(&x)?;
+        let x = if only_last_output {
+            x.i((.., seq_len - 1, ..))?
+        } else {
+            x
+        };
+        let logits = self.lm_head.forward(&x)?;
+        let logits = if detach_grads {
+            logits.detach()
+        } else {
+            logits
+        };
+
+        Ok(logits)
+    }
+
+    pub fn new_kv_cache(&self) ->  candle_core::Result<KVCache> {
         let num_hidden_layers = self.blocks.len();
-        Ok(Cache {
-            masks: Arc::new(Mutex::new(HashMap::new())),
-            use_kv_cache,
-            kvs: Arc::new(Mutex::new(vec![None; num_hidden_layers])),
-            device: device.clone(),
-            cos,
-            sin,
-            num_hidden_layers
+        Ok(KVCache {
+            kvs: vec![None; num_hidden_layers],
+            num_hidden_layers,
+            tokens_processed: 0
         })
+    }
+
+    fn mask(&self, a: usize, b: usize) -> candle_core::Result<Tensor> {
+        let mut masks = self.masks.lock().unwrap();
+        if let Some(mask) = masks.get(&(a, b)) {
+            Ok(mask.clone())
+        } else {
+            let mask_vec: Vec<_> = (b-a..b)
+                .flat_map(|output_position| (0..b).map(move |input_position| u8::from(input_position > output_position)))
+                .collect();
+            let mask = Tensor::from_slice(&mask_vec, (a, b), &self.device)?;
+            masks.insert((a, b), mask.clone());
+            Ok(mask)
+        }
     }
 }

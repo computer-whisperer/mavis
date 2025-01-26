@@ -385,7 +385,13 @@ pub(crate) async fn handle_udp(
                         // Got audio
                         match payload {
                             VoicePacketPayload::Opus(data, end_of_transmission) => {
-                                incoming_opus_tx.send((session_id, data.to_vec(), end_of_transmission)).await.unwrap();
+                                if incoming_opus_tx.capacity() == 0 {
+                                    eprintln!("Incoming Opus queue is full! dropping packet");
+                                    continue;
+                                }
+                                else {
+                                    incoming_opus_tx.send((session_id, data.to_vec(), end_of_transmission)).await.unwrap();
+                                }
                             }
                             _ => {
                                 // Unknown format

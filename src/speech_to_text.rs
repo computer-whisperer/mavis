@@ -341,9 +341,31 @@ impl SpeechToText {
     }
 
     pub async fn stt_task(mut self,
-                          mut opus_receiver: mpsc::Receiver<(u32, Vec<u8>, bool)>,
+                          mut pcm_receiver: mpsc::Receiver<(u32, Vec<f32>)>,
                           new_stt_tx: mpsc::Sender<(u32, String)>
     ) {
+        loop {
+            if let Some((session_id, pcm_data)) = pcm_receiver.recv().await {
+                let mel = self.pcm_to_mel(&pcm_data).unwrap();
+                let res = self.run(&mel, None).unwrap();
+                self.reset_kv_cache();
+                for segment in res {
+                    if segment.dr.no_speech_prob < 0.2 {
+                        // Strip all special tokens (like <thing>)
+                        //let text = re.replace_all(segment.dr.text.as_str(), "").into_owned();
+                        //println!("STT: {}", segment.dr.text);
+                        new_stt_tx.send((session_id, segment.dr.text)).await.unwrap();
+                    }
+                }
+            }
+        }
+    }
+
+    pub async fn stt_opus_task(
+                          mut opus_receiver: mpsc::Receiver<(u32, Vec<u8>, bool)>,
+                          mut pcm_sender: mpsc::Sender<(u32, Vec<f32>)>
+    )
+    {
         let mut opus_decoders = HashMap::<u32, opus::Decoder>::new();
         let mut pcm_buffers = HashMap::<u32, Vec::<f32>>::new();
         let mut audio_packet_timeouts = HashMap::<u32, Option<Instant>>::new();
@@ -403,20 +425,8 @@ impl SpeechToText {
             }
 
             for session_id in finish_packets {
-                let pcm_buffer = pcm_buffers.get_mut(&session_id).unwrap();
-                let mel = self.pcm_to_mel(&pcm_buffer).unwrap();
-                pcm_buffer.clear();
-                pcm_buffer.extend_from_slice(&[0.0; 5000]);
-                let res = self.run(&mel, None).unwrap();
-                self.reset_kv_cache();
-                for segment in res {
-                    if segment.dr.no_speech_prob < 0.2 {
-                        // Strip all special tokens (like <thing>)
-                        //let text = re.replace_all(segment.dr.text.as_str(), "").into_owned();
-                        //println!("STT: {}", segment.dr.text);
-                        new_stt_tx.send((session_id, segment.dr.text)).await.unwrap();
-                    }
-                }
+                let pcm_buffer = pcm_buffers.insert(session_id, vec![0.0; 5000]).unwrap();
+                pcm_sender.send((session_id, pcm_buffer)).await.unwrap();
                 audio_packet_timeouts.insert(session_id, None);
             }
         }
