@@ -170,17 +170,18 @@ impl Record {
 
 pub(crate) struct ChatBot {
     loaded_context: Vec<Record>,
-    text_generation: TextGeneration,
-    text_generation_context: TextGenerationContext,
+    pub(crate) text_generation: TextGeneration,
+    pub(crate) text_generation_context: TextGenerationContext,
     context_log_file: Option<File>,
     data_directory: std::path::PathBuf,
     username: String,
     do_tts: bool,
-    do_prompt: bool,
+    force_text_reply: bool,
+    do_reply_test: bool,
     last_trained_message_datetime: Option<DateTime<Utc>>,
     training_cycles_since_last_save: usize,
     prompt_threshold: f32,
-    logits_processor: LogitsProcessor
+    pub(crate) logits_processor: LogitsProcessor
 }
 
 impl ChatBot {
@@ -212,10 +213,11 @@ impl ChatBot {
             data_directory,
             username: "mavis".to_string(),
             do_tts: false,
-            do_prompt: true,
+            do_reply_test: true,
+            force_text_reply: true,
             last_trained_message_datetime: loaded_datetime,
             training_cycles_since_last_save: 0,
-            prompt_threshold: 1.0,
+            prompt_threshold: 0.3,
             logits_processor
         }
     }
@@ -303,7 +305,7 @@ impl ChatBot {
                 true
             };
 
-            if false && do_train {
+            if do_train {
                 // Get tokens out of current context and clear existing context
                 let mut temp_context = self.text_generation.new_context().unwrap();
                 core::mem::swap(&mut temp_context, &mut self.text_generation_context);
@@ -317,7 +319,7 @@ impl ChatBot {
                 training_context.add_tokens(pre_train_tokens).unwrap();
 
                 println!("Training lora! {} tokens of context and {} tokens for training", pre_train_tokens.len(), training_tokens.len() );
-                self.text_generation.train_tokens(Some(&mut training_context), training_tokens, 0.00001).unwrap();
+                self.text_generation.train_tokens(Some(&mut training_context), training_tokens, 0.00003).unwrap();
 
                 self.last_trained_message_datetime = Some(last_timestamp);
                 self.training_cycles_since_last_save += 1;
@@ -352,12 +354,26 @@ impl ChatBot {
         }
         let llm_text = record.to_llm_text();
         println!("{}", llm_text.replace("\n", " "));
-        if llm_text.len() < 200 {
+        if llm_text.len() < 300 {
             self.loaded_context.push(record);
             if add_to_llm_context {
                 self.text_generation_context.add_unprocessed_text(&llm_text);
                 self.roll_text_generation_context();
             }
+        }
+    }
+
+    pub fn forget(&mut self, mut how_many: usize) {
+        if how_many > self.loaded_context.len() {
+            how_many = self.loaded_context.len();
+        }
+        let len = self.loaded_context.len();
+        self.loaded_context.drain(len-how_many..);
+
+        // load the model with the remaining context
+        self.text_generation_context = self.text_generation.new_context().unwrap();
+        for record in &self.loaded_context {
+            self.text_generation_context.add_unprocessed_text(&record.to_llm_text());
         }
     }
 
@@ -423,6 +439,19 @@ impl ChatBot {
                                     if parts[1] == "dump" {
                                         println!("{}", self.text_generation_context.to_string())
                                     }
+                                    if parts[1] == "forget" {
+                                        if parts.len() > 2 {
+                                            if let Ok(how_many) = parts[2].parse::<usize>() {
+                                                self.forget(how_many);
+                                            }
+                                            else {
+                                                self.forget(1);
+                                            }
+                                        }
+                                        else {
+                                            self.forget(1);
+                                        }
+                                    }
                                     if parts[1] == "threshold" {
                                         if parts.len() > 2 {
                                             if let Ok(threshold) = parts[2].parse::<f32>() {
@@ -441,7 +470,7 @@ impl ChatBot {
                                 });
                                 self.process_new_record(new_record, true, true);
                                 do_prompt_model = true;
-                                force_model_to_talk = true;
+                                force_model_to_talk = self.force_text_reply;
                             }
                         }
                         MumbleEvent::ServerConnected() => {
@@ -472,7 +501,7 @@ impl ChatBot {
                     force_model_to_talk = false;
                 }
             }
-            if do_prompt_model && self.do_prompt {
+            if do_prompt_model {
                 for i in 0..4 {
                     if !mumble_event_receiver.is_empty() || !new_stt_rx.is_empty() {
                         break;
@@ -484,31 +513,37 @@ impl ChatBot {
                     else {
                         let score = self.text_generation.query_next_generation_logit(&mut self.text_generation_context.clone(), format!("[{}]:", self.username).as_str()).unwrap();
                         println!("Mavis reply score: {}", score);
-                        score < self.prompt_threshold
+                        self.do_reply_test && score < self.prompt_threshold
                     };
 
                     if do_prompt {
-                        self.text_generation_context.add_unprocessed_text(format!("[{}]: ", self.username).as_str());
-
+                        self.text_generation_context.add_unprocessed_text(format!("[{}]:", self.username).as_str());
+                        let old_context = self.text_generation_context.clone();
                         let result = self.text_generation.run(&mut self.text_generation_context, &mut self.logits_processor);
                         if let Ok(mut text_result) = result {
-                            // Newline token
-                            self.text_generation_context.add_unprocessed_text("\n");
+                            let stripped_result = String::from(text_result.trim());
+                            if stripped_result.is_empty() {
+                                // Revert
+                                self.text_generation_context = old_context;
+                                break;
+                            } else {
+                                // Newline token
+                                self.text_generation_context.add_unprocessed_text("\n");
 
-                            if self.do_tts { // Voice
-                                new_tts_tx.send(text_result.clone()).await.unwrap();
-                                new_tx_messages_tx.send(text_result.clone()).await.unwrap();
+                                if self.do_tts { // Voice
+                                    new_tts_tx.send(text_result.clone()).await.unwrap();
+                                    new_tx_messages_tx.send(stripped_result.clone()).await.unwrap();
+                                }
+                                else {
+                                    new_tx_messages_tx.send(stripped_result.clone()).await.unwrap();
+                                }
+                                let new_record = Record::GeneratedMessage(GeneratedMessageRecord{
+                                    time: Utc::now(),
+                                    username: self.username.clone(),
+                                    text: stripped_result.replace("\n", " ")
+                                });
+                                self.process_new_record(new_record, true, false);
                             }
-                            else {
-                                new_tx_messages_tx.send(text_result.clone()).await.unwrap();
-                            }
-                            let new_record = Record::GeneratedMessage(GeneratedMessageRecord{
-                                time: Utc::now(),
-                                username: self.username.clone(),
-                                text: text_result.replace("\n", " ")
-                            });
-                            self.process_new_record(new_record, true, false);
-                            sleep(Duration::from_secs(1)).await;
                         }
                         else {
                             println!("Error generating response: {:?}", result);

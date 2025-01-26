@@ -15,7 +15,7 @@ enum Transformer {
     Quantized(qtransformer::Model),
 }
 
-pub struct TextToSpeech {
+pub struct MetavoiceTextToSpeech {
     device: Device,
     fs_tokenizer: tokenizers::BPE,
     first_stage_model: Transformer,
@@ -29,7 +29,7 @@ pub struct TextToSpeech {
 pub const ENCODEC_NTOKENS: u32 = 1024;
 
 
-impl TextToSpeech {
+impl MetavoiceTextToSpeech {
     pub fn new(device: Device) -> anyhow::Result<Self> {
         let model_path = "/ceph-fuse/public/neural_models/text_to_speech/candle-metavoice";
         let encodec_path = "/ceph-fuse/public/neural_models/text_to_speech/encodec_24khz";

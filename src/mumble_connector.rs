@@ -20,7 +20,7 @@ use tokio::time::{sleep, sleep_until};
 use tokio_native_tls::{native_tls, TlsConnector};
 use tokio_util::codec::Decoder;
 use tokio_util::udp::UdpFramed;
-use crate::text_to_speech::TextToSpeech;
+use crate::metavoice_text_to_speech::MetavoiceTextToSpeech;
 
 
 pub enum MumbleEvent {

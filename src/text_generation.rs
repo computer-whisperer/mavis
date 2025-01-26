@@ -59,8 +59,8 @@ impl TextGenerationContext {
 
         self.tokens = new_tokens;
         self.unprocessed_text = String::new();
-        //self.kv_cache.truncate(tokens_to_keep)?;
-        self.kv_cache.reset();
+        self.kv_cache.truncate(tokens_to_keep)?;
+        //self.kv_cache.reset();
         self.last_logits = None;
         Ok(())
     }
@@ -280,7 +280,7 @@ impl TextGeneration {
         else {
             vec![self.bos_token_id]
         };
-        trained_tokens.extend(self.tokenizer.encode(trained_text, true).unwrap().get_ids().to_vec());
+        trained_tokens.extend(self.tokenizer.encode(trained_text, false).unwrap().get_ids().to_vec());
         self.train_tokens(context, &trained_tokens, learning_rate)
     }
 
@@ -368,8 +368,8 @@ impl TextGeneration {
 
         let mut generated_tokens = 0usize;
         {
-            let unprocessed_tokens = context.get_unprocessed_tokens()?;
-            println!("{} unprocessed tokens", unprocessed_tokens.len());
+            //let unprocessed_tokens = context.get_unprocessed_tokens()?;
+            //println!("{} unprocessed tokens", unprocessed_tokens.len());
         }
 
         let sample_len = 100;
