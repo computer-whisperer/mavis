@@ -1,11 +1,12 @@
 
 
-struct F5TextToSpeech {
+pub struct F5TextToSpeech {
 
 }
 
 impl F5TextToSpeech {
-    fn new() -> Result<Self> {
+    pub fn new() -> candle_core::Result<Self> {
         // Implementation goes here
+        Ok(Self {})
     }
 }

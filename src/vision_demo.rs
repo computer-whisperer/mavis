@@ -1,4 +1,3 @@
-mod secrets;
 
 use std::fs;
 use base64::Engine;

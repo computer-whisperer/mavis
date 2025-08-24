@@ -109,8 +109,6 @@ pub struct TextGeneration {
     eos_token_ids: Vec<u32>,
     bos_token_id: u32,
     optimizer: AdamW,
-    max_inference_context_tokens: usize,
-    max_train_context_tokens: usize,
     verbose: bool,
     lora_vm: VarMap
 }
@@ -138,8 +136,8 @@ impl std::error::Error for TextGenerationError{
 
 impl TextGeneration {
 
-    pub(crate) fn new(device: Device, lora_safetensors_path: Option<std::path::PathBuf>) -> Result<Self, Box<dyn std::error::Error>> {
-        let model_path =  "/ceph-fuse/public/neural_models/llms/Meta-Llama-3-8B.Q4_K_M.gguf";
+    pub fn new(device: Device, lora_safetensors_path: Option<std::path::PathBuf>) -> Result<Self, Box<dyn std::error::Error>> {
+        let model_path =  "/ceph-fuse/public/neural_models/llms/Llama-3-8B.Q4_K_M.gguf";
         //let model_path =  "/ceph-fuse/public/neural_models/llms/Meta-Llama-3.1-8B";
         // If it's a dir, it's probably a safetensors import
         let model_path = std::path::Path::new(model_path);
@@ -201,7 +199,7 @@ impl TextGeneration {
             let model = Llama::new_from_gguf(device.clone(), gguf_content, &mut file, DType::F32)?;
 
             // temp
-            let tokenizer_filename = model_path.join("/ceph-fuse/public/neural_models/llms/Meta-Llama-3.1-8B/tokenizer.json");
+            let tokenizer_filename = model_path.join("/ceph-fuse/public/neural_models/llms/Llama-3.1-8B/tokenizer.json");
             let tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(anyhow::Error::msg)?;
 
             (model, tokenizer)
@@ -249,8 +247,6 @@ impl TextGeneration {
             bos_token_id,
             eos_token_ids,
             optimizer,
-            max_inference_context_tokens: 2048,
-            max_train_context_tokens: 350,
             verbose: false,
             lora_vm: lora_var_map
         })
@@ -310,15 +306,6 @@ impl TextGeneration {
         Ok(())
     }
 
-
-    pub(crate) fn get_max_train_context_tokens(&self) -> usize {
-        self.max_train_context_tokens
-    }
-
-    pub(crate) fn get_max_inference_context_tokens(&self) -> usize {
-        self.max_inference_context_tokens
-    }
-
     pub fn query_next_generation_logit(&self, context: &mut TextGenerationContext, test: &str) -> anyhow::Result<f32> {
         self.process_context(context)?;
 
@@ -358,13 +345,9 @@ impl TextGeneration {
         Ok(())
     }
 
-    pub(crate) fn run(&self, context: &mut TextGenerationContext, logits_processor: &mut LogitsProcessor) -> anyhow::Result<String> {
+    pub fn run(&self, context: &mut TextGenerationContext, logits_processor: &mut LogitsProcessor) -> anyhow::Result<String> {
 
         use std::io::Write;
-
-        if context.tokens.len() > self.max_inference_context_tokens {
-            return Err(TextGenerationError::ContextTooLong.into());
-        }
 
         let mut generated_tokens = 0usize;
         {

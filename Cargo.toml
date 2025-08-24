@@ -11,6 +11,10 @@ path = "src/main.rs"
 name = "vision_demo"
 path = "src/vision_demo.rs"
 
+[[bin]]
+name = "simple_test"
+path = "src/simple_test.rs"
+
 [dependencies]
 argparse = "0.2.1"
 futures = "0.3.31"
@@ -35,6 +39,7 @@ rand = "0.8.5"
 byteorder = "1.5.0"
 opus = "0.3.0"
 regex = "1.11.1"
+rubato = "0.16.1"
 
 candle-transformers = { path="libs/candle/candle-transformers", version = "0.8.2" }
 candle-core = { path="libs/candle/candle-core", version = "0.8.2" }

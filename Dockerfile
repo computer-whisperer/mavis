@@ -23,7 +23,11 @@ RUN apt update && apt install -y \
     vulkan-tools \
     libnvidia-gl-565 \
     protobuf-compiler \
-    libcutlass-dev
+    libcutlass-dev \
+    python3-dev \
+    python3-pip \
+    python3-venv
+RUN pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126 --break-system-packages
 RUN rustup default nightly
 
 RUN useradd -rm -d /home/ubuntu -s /bin/bash -g root -G sudo -u 1001 test

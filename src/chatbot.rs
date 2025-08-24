@@ -5,11 +5,11 @@ use std::fs;
 use std::fs::File;
 use std::io::Write;
 use std::str::FromStr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use candle_core::Device;
 use candle_transformers::generation::LogitsProcessor;
 use chrono::{DateTime, Utc};
-use tokio::time::sleep;
+use tokio::time::{sleep, sleep_until};
 use crate::mumble_connector::MumbleEvent;
 use crate::text_generation::{TextGeneration, TextGenerationContext};
 
@@ -181,7 +181,8 @@ pub(crate) struct ChatBot {
     last_trained_message_datetime: Option<DateTime<Utc>>,
     training_cycles_since_last_save: usize,
     prompt_threshold: f32,
-    pub(crate) logits_processor: LogitsProcessor
+    pub(crate) logits_processor: LogitsProcessor,
+    max_message_streak: u32
 }
 
 impl ChatBot {
@@ -217,8 +218,9 @@ impl ChatBot {
             force_text_reply: true,
             last_trained_message_datetime: loaded_datetime,
             training_cycles_since_last_save: 0,
-            prompt_threshold: 0.3,
-            logits_processor
+            prompt_threshold: 0.35,
+            logits_processor,
+            max_message_streak: 4
         }
     }
 
@@ -293,8 +295,8 @@ impl ChatBot {
     }
 
     fn roll_text_generation_context(&mut self) {
-        let max_training_tokens = 256;
-        let max_non_training_tokens = 700;
+        let max_training_tokens = 128;
+        let max_non_training_tokens = 2048;
         let records_advance = 10;
         let save_every_n_cycles = 10;
         if self.text_generation_context.get_approximate_num_tokens_in_context() > max_non_training_tokens + max_training_tokens {
@@ -319,7 +321,7 @@ impl ChatBot {
                 training_context.add_tokens(pre_train_tokens).unwrap();
 
                 println!("Training lora! {} tokens of context and {} tokens for training", pre_train_tokens.len(), training_tokens.len() );
-                self.text_generation.train_tokens(Some(&mut training_context), training_tokens, 0.00003).unwrap();
+                self.text_generation.train_tokens(Some(&mut training_context), training_tokens, 0.00006).unwrap();
 
                 self.last_trained_message_datetime = Some(last_timestamp);
                 self.training_cycles_since_last_save += 1;
@@ -383,175 +385,198 @@ impl ChatBot {
         mut new_stt_rx: mpsc::Receiver<(u32, String)>,
         mut new_tts_tx: mpsc::Sender<String>,
         user_map: Arc::<Mutex<HashMap<u32, String>>>,
-        new_tx_messages_tx: mpsc::Sender<String>
+        new_tx_messages_tx: mpsc::Sender<String>,
+        mut may_talk_after_receiver: mpsc::Receiver<Instant>
     ) {
+        let mut mavis_needs_to_try_talking = false;
+        let mut mavis_must_talk = false;
+        let mut mavis_message_streak = 0;
+        let mut may_talk_after: Instant = Instant::now();
         loop {
-            let mut do_prompt_model = false;
-            let mut force_model_to_talk = false;
-            tokio::select! {
-                Some(event) = mumble_event_receiver.recv() => {
-                    match event {
-                        MumbleEvent::UserConnected(session_id) => {
-                            let username = user_map.lock().unwrap().get(&session_id).cloned().unwrap_or_else(|| String::from("Unknown"));
-                            let new_record = Record::UserConnected(UserConnectedRecord {
-                                time: Utc::now(),
-                                username,
-                            });
-                            self.process_new_record(new_record, true, true);
-                        },
-                        MumbleEvent::UserPresent(session_id) => {
-                            let username = user_map.lock().unwrap().get(&session_id).cloned().unwrap_or_else(|| String::from("Unknown"));
-                            let new_record = Record::UserPresent(UserPresentRecord {
-                                time: Utc::now(),
-                                username,
-                            });
-                            self.process_new_record(new_record, true, true);
-                        },
-                        MumbleEvent::UserDisconnected(session_id) => {
-                            let username = user_map.lock().unwrap().get(&session_id).cloned().unwrap_or_else(|| String::from("Unknown"));
-                            let new_record = Record::UserDisconnected(UserDisconnectedRecord {
-                                time: Utc::now(),
-                                username,
-                            });
-                            self.process_new_record(new_record, true, true);
-                        },
-                        MumbleEvent::TextMessage((session_id, text)) => {
-                            if text.starts_with("/mavis") {
-                                let parts = text.split(" ").collect::<Vec<&str>>();
-                                if parts.len() >= 2 {
-                                    if parts[1] == "tts" {
-                                        if parts.len() == 2 {
-                                            self.do_tts = !self.do_tts;
-                                        }
-                                        else {
-                                            if parts[2] == "on" || parts[2] == "yes" {
-                                                self.do_tts = true;
+
+            let may_talk_now = Instant::now() >= may_talk_after;
+
+            let do_handle_events = !((may_talk_now && mavis_needs_to_try_talking) && mumble_event_receiver.is_empty() && new_stt_rx.is_empty() && may_talk_after_receiver.is_empty());
+
+            if do_handle_events {
+                tokio::select! {
+                    Some(event) = mumble_event_receiver.recv() => {
+                        match event {
+                            MumbleEvent::UserConnected(session_id) => {
+                                let username = user_map.lock().unwrap().get(&session_id).cloned().unwrap_or_else(|| String::from("Unknown"));
+                                let new_record = Record::UserConnected(UserConnectedRecord {
+                                    time: Utc::now(),
+                                    username,
+                                });
+                                self.process_new_record(new_record, true, true);
+                                mavis_needs_to_try_talking = true;
+                                mavis_message_streak = 0;
+                            },
+                            MumbleEvent::UserPresent(session_id) => {
+                                let username = user_map.lock().unwrap().get(&session_id).cloned().unwrap_or_else(|| String::from("Unknown"));
+                                let new_record = Record::UserPresent(UserPresentRecord {
+                                    time: Utc::now(),
+                                    username,
+                                });
+                                self.process_new_record(new_record, true, true);
+                                mavis_needs_to_try_talking = true;
+                                mavis_message_streak = 0;
+                            },
+                            MumbleEvent::UserDisconnected(session_id) => {
+                                let username = user_map.lock().unwrap().get(&session_id).cloned().unwrap_or_else(|| String::from("Unknown"));
+                                let new_record = Record::UserDisconnected(UserDisconnectedRecord {
+                                    time: Utc::now(),
+                                    username,
+                                });
+                                self.process_new_record(new_record, true, true);
+                                mavis_needs_to_try_talking = true;
+                                mavis_message_streak = 0;
+                            },
+                            MumbleEvent::TextMessage((session_id, text)) => {
+                                if text.starts_with("/mavis") {
+                                    let parts = text.split(" ").collect::<Vec<&str>>();
+                                    if parts.len() >= 2 {
+                                        if parts[1] == "tts" {
+                                            if parts.len() == 2 {
+                                                self.do_tts = !self.do_tts;
                                             }
                                             else {
-                                                self.do_tts = false;
+                                                if parts[2] == "on" || parts[2] == "yes" {
+                                                    self.do_tts = true;
+                                                }
+                                                else {
+                                                    self.do_tts = false;
+                                                }
                                             }
                                         }
-                                    }
-                                    if parts[1] == "prompt" {
-                                        do_prompt_model = true;
-                                        force_model_to_talk = true;
-                                    }
-                                    if parts[1] == "dump" {
-                                        println!("{}", self.text_generation_context.to_string())
-                                    }
-                                    if parts[1] == "forget" {
-                                        if parts.len() > 2 {
-                                            if let Ok(how_many) = parts[2].parse::<usize>() {
-                                                self.forget(how_many);
+                                        if parts[1] == "prompt" {
+                                            mavis_must_talk = true;
+                                        }
+                                        if parts[1] == "dump" {
+                                            println!("{}", self.text_generation_context.to_string())
+                                        }
+                                        if parts[1] == "forget" {
+                                            if parts.len() > 2 {
+                                                if let Ok(how_many) = parts[2].parse::<usize>() {
+                                                    self.forget(how_many);
+                                                }
+                                                else {
+                                                    self.forget(1);
+                                                }
                                             }
                                             else {
                                                 self.forget(1);
                                             }
                                         }
-                                        else {
-                                            self.forget(1);
-                                        }
-                                    }
-                                    if parts[1] == "threshold" {
-                                        if parts.len() > 2 {
-                                            if let Ok(threshold) = parts[2].parse::<f32>() {
-                                                self.prompt_threshold = threshold;
+                                        if parts[1] == "threshold" {
+                                            if parts.len() > 2 {
+                                                if let Ok(threshold) = parts[2].parse::<f32>() {
+                                                    self.prompt_threshold = threshold;
+                                                }
                                             }
                                         }
                                     }
                                 }
+                                else {
+                                    let username = user_map.lock().unwrap().get(&session_id).cloned().unwrap_or_else(|| String::from("Unknown"));
+                                    let new_record = Record::TextMessage(TextMessageRecord{
+                                        time: Utc::now(),
+                                        username,
+                                        text
+                                    });
+                                    self.process_new_record(new_record, true, true);
+                                    mavis_must_talk = true;
+                                    mavis_message_streak = 0;
+                                }
                             }
-                            else {
-                                let username = user_map.lock().unwrap().get(&session_id).cloned().unwrap_or_else(|| String::from("Unknown"));
-                                let new_record = Record::TextMessage(TextMessageRecord{
+                            MumbleEvent::ServerConnected() => {
+                                    let new_record = Record::ServerConnected(ServerConnectedRecord{
+                                        time: Utc::now()
+                                    });
+                                    self.process_new_record(new_record, true, true);
+                            }
+                            MumbleEvent::EnteredChannel(channel_name) => {
+                                let new_record = Record::EnteredChannel(EnteredChannelRecord{
                                     time: Utc::now(),
-                                    username,
-                                    text
+                                    channel: channel_name
                                 });
                                 self.process_new_record(new_record, true, true);
-                                do_prompt_model = true;
-                                force_model_to_talk = self.force_text_reply;
-                            }
-                        }
-                        MumbleEvent::ServerConnected() => {
-                                let new_record = Record::ServerConnected(ServerConnectedRecord{
-                                    time: Utc::now()
-                                });
-                                self.process_new_record(new_record, true, true);
-                        }
-                        MumbleEvent::EnteredChannel(channel_name) => {
-                            let new_record = Record::EnteredChannel(EnteredChannelRecord{
-                                time: Utc::now(),
-                                channel: channel_name
-                            });
-                            self.process_new_record(new_record, true, true);
-                        }}
-                }
-                Some((session_id, text)) = new_stt_rx.recv() => {
-                    let username = user_map.lock().unwrap().get(&session_id).cloned().unwrap_or_else(|| String::from("Unknown"));
-                    let sanitized_text = String::from(text.trim());
-                    let new_record = Record::STTMessage(STTMessageRecord{
-                        time: Utc::now(),
-                        username,
-                        text: sanitized_text
-                    });
-                    self.process_new_record(new_record, true, true);
+                            }}
+                    }
+                    Some((session_id, text)) = new_stt_rx.recv() => {
+                        let username = user_map.lock().unwrap().get(&session_id).cloned().unwrap_or_else(|| String::from("Unknown"));
+                        let sanitized_text = String::from(text.trim());
+                        let new_record = Record::STTMessage(STTMessageRecord{
+                            time: Utc::now(),
+                            username,
+                            text: sanitized_text
+                        });
+                        self.process_new_record(new_record, true, true);
+                        mavis_message_streak = 0;
+                        mavis_needs_to_try_talking = true;
+                    }
+                    Some(i) = may_talk_after_receiver.recv() => {
+                        may_talk_after = i;
+                    }
+                    Some(_) = async {if may_talk_now {None} else {Some(sleep_until(may_talk_after.into()).await)}} => {
 
-                    do_prompt_model = true;
-                    force_model_to_talk = false;
+                    }
                 }
             }
-            if do_prompt_model {
-                for i in 0..4 {
-                    if !mumble_event_receiver.is_empty() || !new_stt_rx.is_empty() {
+
+            if !mumble_event_receiver.is_empty() || !new_stt_rx.is_empty() || !may_talk_now {
+                continue;
+            }
+
+            let do_prompt = if mavis_must_talk {
+                true
+            }
+            else if mavis_needs_to_try_talking {
+                let score = self.text_generation.query_next_generation_logit(&mut self.text_generation_context.clone(), format!("[{}]:", self.username).as_str()).unwrap();
+                println!("Mavis reply score: {}", score);
+                self.do_reply_test && score < self.prompt_threshold
+            }
+            else {
+                false
+            };
+
+            mavis_needs_to_try_talking = false;
+            mavis_must_talk = false;
+
+            if do_prompt {
+                self.text_generation_context.add_unprocessed_text(format!("[{}]:", self.username).as_str());
+                let old_context = self.text_generation_context.clone();
+                let result = self.text_generation.run(&mut self.text_generation_context, &mut self.logits_processor);
+                if let Ok(mut text_result) = result {
+                    let stripped_result = String::from(text_result.trim());
+                    if stripped_result.is_empty() {
+                        // Revert
+                        self.text_generation_context = old_context;
                         break;
-                    }
+                    } else {
+                        // Newline token
+                        self.text_generation_context.add_unprocessed_text("\n");
 
-                    let do_prompt = if (i == 0 && force_model_to_talk) {
-                        true
-                    }
-                    else {
-                        let score = self.text_generation.query_next_generation_logit(&mut self.text_generation_context.clone(), format!("[{}]:", self.username).as_str()).unwrap();
-                        println!("Mavis reply score: {}", score);
-                        self.do_reply_test && score < self.prompt_threshold
-                    };
-
-                    if do_prompt {
-                        self.text_generation_context.add_unprocessed_text(format!("[{}]:", self.username).as_str());
-                        let old_context = self.text_generation_context.clone();
-                        let result = self.text_generation.run(&mut self.text_generation_context, &mut self.logits_processor);
-                        if let Ok(mut text_result) = result {
-                            let stripped_result = String::from(text_result.trim());
-                            if stripped_result.is_empty() {
-                                // Revert
-                                self.text_generation_context = old_context;
-                                break;
-                            } else {
-                                // Newline token
-                                self.text_generation_context.add_unprocessed_text("\n");
-
-                                if self.do_tts { // Voice
-                                    new_tts_tx.send(text_result.clone()).await.unwrap();
-                                    new_tx_messages_tx.send(stripped_result.clone()).await.unwrap();
-                                }
-                                else {
-                                    new_tx_messages_tx.send(stripped_result.clone()).await.unwrap();
-                                }
-                                let new_record = Record::GeneratedMessage(GeneratedMessageRecord{
-                                    time: Utc::now(),
-                                    username: self.username.clone(),
-                                    text: stripped_result.replace("\n", " ")
-                                });
-                                self.process_new_record(new_record, true, false);
-                            }
+                        if self.do_tts { // Voice
+                            new_tts_tx.send(text_result.clone()).await.unwrap();
+                            may_talk_after = Instant::now() + Duration::from_secs(15);
                         }
-                        else {
-                            println!("Error generating response: {:?}", result);
+                        new_tx_messages_tx.send(stripped_result.clone()).await.unwrap();
+                        let new_record = Record::GeneratedMessage(GeneratedMessageRecord{
+                            time: Utc::now(),
+                            username: self.username.clone(),
+                            text: stripped_result.replace("\n", " ")
+                        });
+                        self.process_new_record(new_record, true, false);
+
+                        mavis_message_streak += 1;
+                        if mavis_message_streak < self.max_message_streak {
+                            mavis_needs_to_try_talking = true;
                         }
                     }
-                    else {
-                        break;
-                    }
+                }
+                else {
+                    println!("Error generating response: {:?}", result);
                 }
             }
         }

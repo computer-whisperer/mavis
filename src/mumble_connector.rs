@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use futures::{SinkExt, StreamExt};
 use mumble_protocol_2x::control::{msgs, ClientControlCodec, ControlPacket};
 use regex::Regex;
+use rubato::Resampler;
 use socket2::{Domain, SockAddr, Socket, Type};
 use tokio::net::TcpStream;
 use tokio::net::UdpSocket;
@@ -38,10 +39,10 @@ pub(crate) async fn connect(
     user_name: String,
     pass_word: Option<String>,
     accept_invalid_cert: bool,
-    crypt_state_sender: mpsc::Sender<ClientCryptState>,
     mumble_event_sender: mpsc::Sender<MumbleEvent>,
     mut new_tx_messages_rx: mpsc::Receiver<String>,
-    mut must_resync_crypt_rx: mpsc::Receiver<()>,
+    incoming_opus_sender: mpsc::Sender<(u32, Vec<u8>, bool)>,
+    outgoing_opus_receiver: mpsc::Receiver<(Vec<u8>, bool, Duration)>,
     user_map: Arc<Mutex<HashMap<u32, String>>>,
 ) {
 
@@ -72,7 +73,11 @@ pub(crate) async fn connect(
 
     // Version
     let mut msg = mumble_protocol_2x::control::msgs::Version::new();
-    msg.set_version_v1(0x01000000);
+    let major = 1u64;
+    let minor = 5u64;
+    let patch = 0u64;
+    msg.set_version_v1((major<<16 | minor<<8 | patch) as u32);
+    msg.set_version_v2(major<<32 | minor<<16 | patch);
     sink.send(msg.into()).await.unwrap();
 
     // Authenticate
@@ -99,6 +104,16 @@ pub(crate) async fn connect(
     let mut channel_names = HashMap::<u32, String>::new();
 
     mumble_event_sender.send(MumbleEvent::ServerConnected()).await.unwrap();
+
+    let (crypt_state_sender, crypt_state_receiver) = mpsc::channel::<ClientCryptState>(8);
+    let (must_resync_crypt_tx, mut must_resync_crypt_rx) = mpsc::channel::<()>(1);
+    tokio::spawn(handle_udp(
+        server_addr,
+        crypt_state_receiver,
+        incoming_opus_sender,
+        outgoing_opus_receiver,
+        must_resync_crypt_tx,
+    ));
 
     // Handle incoming packets
     loop {
@@ -304,11 +319,9 @@ pub(crate) async fn handle_udp(
     server_addr: SocketAddr,
     mut crypt_state_recv: mpsc::Receiver<ClientCryptState>,
     mut incoming_opus_tx: mpsc::Sender<(u32, Vec<u8>, bool)>,
-    mut outgoing_opus_rx: mpsc::Receiver<(Vec<u8>, bool)>,
+    mut outgoing_opus_rx: mpsc::Receiver<(Vec<u8>, bool, Duration)>,
     must_resync_crypt_tx: mpsc::Sender<()>,
 ) {
-
-
     let inner_socket = Socket::new(Domain::ipv6(), Type::dgram(), None).unwrap();
     let addr = SocketAddrV6::new(Ipv6Addr::from(0u128), 0u16, 0, 0).into();
     inner_socket.bind(&addr).expect("Failed to bind UDP socket");
@@ -348,7 +361,10 @@ pub(crate) async fn handle_udp(
     let mut last_resync_request_time = Instant::now();
 
     let mut next_ping_time = Instant::now();
+    let mut next_sendable_audio_time = Instant::now();
     loop {
+        let may_send_audio = next_sendable_audio_time <= Instant::now();
+
         tokio::select! {
             Some(new_crypt_state) = crypt_state_recv.recv() => {
                 println!("Adding new crypt state");
@@ -400,8 +416,9 @@ pub(crate) async fn handle_udp(
                     }
                 }
             }
-            Some((data, is_last)) = outgoing_opus_rx.recv() => {
+            Some((data, is_last, duration)) = async {if may_send_audio {outgoing_opus_rx.recv().await} else {None}} => {
                 let data_bytes = Bytes::copy_from_slice(&data);
+                next_sendable_audio_time = Instant::now() + duration;
                 udp_framed.send((
                     VoicePacket::Audio {
                         _dst: std::marker::PhantomData,

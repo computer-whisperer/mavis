@@ -341,9 +341,11 @@ impl SpeechToText {
     }
 
     pub async fn stt_task(mut self,
-                          mut pcm_receiver: mpsc::Receiver<(u32, Vec<f32>)>,
-                          new_stt_tx: mpsc::Sender<(u32, String)>
+                          opus_receiver: mpsc::Receiver<(u32, Vec<u8>, bool)>,
+                          new_stt_sender: mpsc::Sender<(u32, String)>
     ) {
+        let (pcm_sender, mut pcm_receiver) = mpsc::channel::<(u32, Vec<f32>)>(64);
+        tokio::spawn(Self::stt_opus_task(opus_receiver, pcm_sender));
         loop {
             if let Some((session_id, pcm_data)) = pcm_receiver.recv().await {
                 let mel = self.pcm_to_mel(&pcm_data).unwrap();
@@ -354,7 +356,7 @@ impl SpeechToText {
                         // Strip all special tokens (like <thing>)
                         //let text = re.replace_all(segment.dr.text.as_str(), "").into_owned();
                         //println!("STT: {}", segment.dr.text);
-                        new_stt_tx.send((session_id, segment.dr.text)).await.unwrap();
+                        new_stt_sender.send((session_id, segment.dr.text)).await.unwrap();
                     }
                 }
             }
