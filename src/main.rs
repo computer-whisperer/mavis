@@ -1,4 +1,15 @@
 use std::collections::HashMap;
+use axum::{
+    Router,
+    extract::ws::{WebSocket, WebSocketUpgrade},
+    response::IntoResponse,
+    routing::get,
+};
+use tower_http::{
+    services::{ServeDir, ServeFile},
+    trace::TraceLayer,
+};
+
 use argparse::{ArgumentParser, StoreOption};
 use argparse::Store;
 use argparse::StoreTrue;
@@ -11,10 +22,12 @@ use std::convert::TryInto;
 use std::net::ToSocketAddrs;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use axum::extract::ws::Message;
 use candle_core::Device;
 use candle_core::utils::cuda_is_available;
 use candle_transformers::generation::LogitsProcessor;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch, Notify};
+use tokio::sync::watch::{Receiver, Sender};
 use tokio_util::codec::Decoder;
 mod text_generation;
 mod speech_to_text;
@@ -27,6 +40,7 @@ mod parler_text_to_speech;
 //mod f5_text_to_speech;
 
 use chatbot::ChatBot;
+use mavis_proto::{ChatLogMessage, WebsocketServerClientMessage};
 use text_generation::TextGeneration;
 use crate::mumble_connector::{MumbleEvent};
 use crate::speech_to_text::SpeechToText;
@@ -35,8 +49,11 @@ use crate::parler_text_to_speech::ParlerTextToSpeech;
 
 async fn stt_task(device: Device,
                   opus_receiver: mpsc::Receiver<(u32, Vec<u8>, bool)>,
-                  new_stt_tx: mpsc::Sender<(u32, String)>) {
+                  new_stt_tx: mpsc::Sender<(u32, String)>,
+                  notify_ready: Arc<Notify>
+) {
     let mut speech_to_text = SpeechToText::new(device).unwrap();
+    notify_ready.notify_one();
     speech_to_text.stt_task(opus_receiver, new_stt_tx).await
 }
 
@@ -49,6 +66,54 @@ async fn tts_task(device: Device,
     //text_to_speech.tts_task_streaming(opus_sender, new_tts_rx, may_talk_after_sender).await
     text_to_speech.tts_task_singleshot(opus_sender, new_tts_rx, may_talk_after_sender).await
 }
+
+struct AppData {
+    full_message_log: Arc<Mutex<Vec<ChatLogMessage>>>,
+    new_message_event: Receiver<ChatLogMessage>
+}
+
+async fn websocket_handler(
+    ws: WebSocketUpgrade,
+    full_message_log: Arc<Mutex<Vec<ChatLogMessage>>>,
+    new_message_sender: Sender<()>
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket: WebSocket| handle_socket(socket, full_message_log.clone(), new_message_sender.subscribe()))
+}
+
+async fn send_message(socket: &mut WebSocket, message: WebsocketServerClientMessage) {
+    let mut data = Vec::<u8>::new();
+    ciborium::into_writer(&message, &mut data).unwrap();
+    socket.send(Message::Binary(data.into())).await.unwrap();
+}
+
+async fn handle_socket(
+    mut socket: WebSocket,
+    full_message_log: Arc<Mutex<Vec<ChatLogMessage>>>,
+    mut new_message_receiver: Receiver<()>
+) {
+    let initial_messages = {
+        full_message_log.lock().unwrap().clone()
+    };
+    let mut num_messages_sent = initial_messages.len();
+    send_message(
+        &mut socket,
+        WebsocketServerClientMessage::NewChatMessages(initial_messages)
+    ).await;
+
+    loop {
+        tokio::select! {
+            Ok(_) = new_message_receiver.changed() => {
+                let new_messages = {
+                    let messages = full_message_log.lock().unwrap();
+                    messages[num_messages_sent..].to_vec()
+                };
+                num_messages_sent += new_messages.len();
+                send_message(&mut socket, WebsocketServerClientMessage::NewChatMessages(new_messages)).await;
+            }
+        }
+    }
+}
+
 
 #[tokio::main]
 async fn main() {
@@ -162,7 +227,7 @@ async fn main() {
     let (mumble_event_sender, mumble_event_receiver) = mpsc::channel::<MumbleEvent>(32);
     let (new_tx_messages_sender, new_tx_messages_receiver) = mpsc::channel::<String>(32);
 
-    let (new_stt_sender, new_stt_receiver) = mpsc::channel::<(u32, String)>(32);
+    let (new_stt_sender, mut new_stt_receiver) = mpsc::channel::<(u32, String)>(32);
     let (new_tts_sender, new_tts_receiver) = mpsc::channel::<String>(32);
 
     let (incoming_opus_sender, incoming_opus_receiver) = mpsc::channel::<(u32, Vec<u8>, bool)>(256);
@@ -172,12 +237,17 @@ async fn main() {
 
     let user_map = Arc::new(Mutex::<HashMap<u32, String>>::new(HashMap::new()));
 
-    tokio::spawn(stt_task(device_b.clone(), incoming_opus_receiver, new_stt_sender));
+    let notify_stt_ready = Arc::new(tokio::sync::Notify::new());
+
+    tokio::spawn(stt_task(device_b.clone(), incoming_opus_receiver, new_stt_sender, notify_stt_ready.clone()));
     tokio::spawn(tts_task(device_b.clone(), outgoing_opus_sender, new_tts_receiver, may_talk_after_sender));
 
-    let mut chat_bot = ChatBot::new(device_a);
-    chat_bot.load_context();
+    let messages = Arc::new(Mutex::new(Vec::<ChatLogMessage>::new()));
+    let (message_broadcast_tx, message_broadcast_rx) = watch::channel(());
+    //let mut chat_bot = ChatBot::new(device_a);
+    //chat_bot.load_context();
 
+    notify_stt_ready.notified().await;
     // Handle command line arguments
     let mut server_host = "".to_string();
     let mut server_port = 64738u16;
@@ -225,5 +295,55 @@ async fn main() {
         user_map.clone()
     ));
 
-    chat_bot.run(mumble_event_receiver, new_stt_receiver, new_tts_sender, user_map.clone(), new_tx_messages_sender, may_talk_after_receiver).await
+    let messages_b = messages.clone();
+    let sender_b = message_broadcast_tx.clone();
+    tokio::spawn(async move {
+        let app = Router::new()
+            .route("/health", get(|| async { "ok" }))
+            .route(
+                "/ws",
+                get(move |ws: WebSocketUpgrade| {
+                    websocket_handler(ws, messages_b.clone(), sender_b.clone())
+                }),
+            ) // Add WebSocket endpoint
+            .nest_service("/pkg", ServeDir::new("./crates/mavis-webui/pkg/"))
+            .nest_service(
+                "/assets",
+                ServeDir::new("./crates/mavis-webui/assets/"),
+            )
+            .route_service(
+                "/index.html",
+                ServeFile::new("./crates/mavis-webui/assets/index.html"),
+            )
+            .route_service(
+                "/",
+                ServeFile::new("./crates/mavis-webui/assets/index.html"),
+            )
+            .layer(TraceLayer::new_for_http());
+
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+        tracing::info!("WebUI server listening on port 3000");
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    loop {
+        if let Some((a, b)) = new_stt_receiver.recv().await {
+            let user_map = user_map.lock().unwrap();
+            let user = if let Some(x) = user_map.get(&a) {
+                x.clone()
+            } else {
+                format!("({a})")
+            };
+            let mut messages = messages.lock().unwrap();
+            messages.push(
+                ChatLogMessage{
+                    username: user.clone(),
+                    message_body: b.clone(),
+                }
+            );
+            message_broadcast_tx.send(()).unwrap();
+            println!("{user}, {b}");
+        }
+    }
+    //chat_bot.run(mumble_event_receiver, new_stt_receiver, new_tts_sender, user_map.clone(), new_tx_messages_sender, may_talk_after_receiver).await
 }

@@ -1,7 +1,8 @@
 [package]
 name = "mavis"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
+resolver = "2"
 
 [[bin]]
 name = "mavis"
@@ -40,14 +41,17 @@ byteorder = "1.5.0"
 opus = "0.3.0"
 regex = "1.11.1"
 rubato = "0.16.1"
+tower-http = { version = "0.6.4", features = ["fs", "trace"] }
+ciborium = { version="0.2.2"}
+
 
 candle-transformers = { path="libs/candle/candle-transformers", version = "0.8.2" }
 candle-core = { path="libs/candle/candle-core", version = "0.8.2" }
 candle-nn = { path="libs/candle/candle-nn", version = "0.8.2" }
 candle-examples = { path="libs/candle/candle-examples", version = "0.8.1" }
-candle-flash-attn = {path="libs/candle/candle-flash-attn", version="0.8.2", optional=true}
+axum = { version = "0.8.4", features = ["http2", "tokio", "ws"] }
+mavis-proto = {path="crates/mavis-proto"}
 
 [features]
-flash-attn = ["candle-flash-attn"]
 cuda = ["candle-core/cuda", "candle-nn/cuda"]
 cudnn = ["candle-core/cudnn", "cuda"]

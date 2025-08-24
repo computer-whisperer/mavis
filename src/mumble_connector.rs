@@ -73,11 +73,11 @@ pub(crate) async fn connect(
 
     // Version
     let mut msg = mumble_protocol_2x::control::msgs::Version::new();
-    let major = 1u64;
-    let minor = 5u64;
-    let patch = 0u64;
+    let major = 0u64;
+    let minor = 1u64;
+    let patch = 5u64;
     msg.set_version_v1((major<<16 | minor<<8 | patch) as u32);
-    msg.set_version_v2(major<<32 | minor<<16 | patch);
+    msg.set_version_v2(major<<48 | minor<<32 | patch << 16);
     sink.send(msg.into()).await.unwrap();
 
     // Authenticate

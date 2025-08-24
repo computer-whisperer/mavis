@@ -1,0 +1,46 @@
+[package]
+name = "mavis-webui"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tracing-subscriber = "0.3.19"
+egui = { version = "0.32.0" }
+egui_extras = { version = "0.32.0" }
+eframe = {version = "0.32.0", default-features = false, features = [
+    "default_fonts", # Embed the default egui fonts.
+    "glow",          # Use the glow rendering backend. Alternative: "wgpu".
+    "persistence",   # Enable restoring app state when restarting the app.
+]}
+log = "0.4.27"
+wasm-bindgen-futures = "0.4.50"
+web-sys = { version = "0.3.70", features = ['Document',
+    'Element',
+    'HtmlElement',
+    'Node',
+    'Window',
+    'WebSocket',
+    'MessageEvent',
+    'ErrorEvent',
+    'CloseEvent',
+    'ProgressEvent',
+    'FileReader'
+] }
+ciborium = { version="0.2.2"}
+wasm-bindgen = "0.2.100"
+getrandom = { version = "0.3", features = ["wasm_js"] }
+web-time = "1.1.0"
+tokio = {version = "1.45.0", default-features = false, features = ["sync"]}
+futures = {version = "0.3.31"}
+mavis-proto = {path = "../mavis-proto"}
+
+
+[dependencies]
+strum = "0.27.1"
+serde = { version = "1.0.219", features = ["derive"] }
+rand = "0.9.1"
+thiserror = "2.0.12"
+
